@@ -1,0 +1,5 @@
+using Test
+using War1gusAI
+
+include("protocol_tests.jl")
+include("policy_tests.jl")

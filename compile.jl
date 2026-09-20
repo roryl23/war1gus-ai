@@ -1,17 +1,13 @@
-using ArgParse
 using PackageCompiler
 
-s = ArgParseSettings()
-@add_arg_table! s begin
-  "--incremental"
-    help = "enable incremental compilation"
-    action = :store_true
-end
-parsed_args = parse_args(ARGS, s)
+unknown_args = filter(!=("--incremental"), ARGS)
+isempty(unknown_args) || error("unknown arguments: $(join(unknown_args, ' '))")
+incremental = "--incremental" in ARGS
 
 @time "War1gusAI compilation" PackageCompiler.create_app(
   ".",
-  "build/bin/war1gus-ai",
+  "build",
   force=true,
-  incremental=parsed_args["incremental"],
+  cpu_target="native",
+  incremental=incremental,
 )
