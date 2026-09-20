@@ -10,9 +10,11 @@ const INIT_PREFIX = UInt8('I')
 const STEP_PREFIX = UInt8('S')
 const END_PREFIX = UInt8('E')
 const PROTOCOL_VERSION = UInt32(1)
+const CLIENT_SHUTDOWN_GRACE_SECONDS = 1.0
 
 struct StepFrame
- reward::UInt32
+ sequence::UInt32
+ reward::Int32
  state::Vector{UInt32}
 end
 
@@ -48,18 +50,27 @@ end
 """Read one fixed-size step or end payload after its prefix has been consumed."""
 function decode_step_frame(io::IO, prefix::UInt8)::Union{StepFrame,Nothing}
  (prefix == STEP_PREFIX || prefix == END_PREFIX) || throw(ArgumentError("AI frame has an invalid prefix"))
- bytes = read_exact(io, 4 * (STATE_DIM + 1))
+ bytes = read_exact(io, 4 * (STATE_DIM + 2))
  isnothing(bytes) && return nothing
 
  state = Vector{UInt32}(undef, STATE_DIM)
  for index in eachindex(state)
-  state[index] = decode_u32_be(bytes, 5 + 4 * (index - 1))
+  state[index] = decode_u32_be(bytes, 9 + 4 * (index - 1))
  end
  state[1] == PROTOCOL_VERSION || throw(ArgumentError("unsupported AI state protocol version $(state[1])"))
- return StepFrame(decode_u32_be(bytes, 1), state)
+ return StepFrame(
+  decode_u32_be(bytes, 1),
+  reinterpret(Int32, decode_u32_be(bytes, 5)),
+  state,
+ )
 end
 
-function handle_client(socket::TCPSocket, policy::AiPolicy=DEFAULT_POLICY)::Nothing
+function handle_client(
+ socket::TCPSocket,
+ trainer::OnlineTrainer,
+ sessions::Dict{UInt32,ClientSession},
+ sessions_lock::ReentrantLock,
+)::Nothing
  try
   init = read_exact(socket, 3)
   isnothing(init) && return nothing
@@ -71,11 +82,20 @@ function handle_client(socket::TCPSocket, policy::AiPolicy=DEFAULT_POLICY)::Noth
    prefix = prefix_bytes[1]
    frame = decode_step_frame(socket, prefix)
    isnothing(frame) && return nothing
+   session_id = frame.state[2]
+   session = lock(sessions_lock) do
+    get!(ClientSession, sessions, session_id)
+   end
 
    if prefix == STEP_PREFIX
-    write(socket, UInt8(select_action(policy, frame.state)))
+    action = process_step!(trainer, session, frame.sequence, frame.reward, frame.state)
+    write(socket, UInt8(action))
     flush(socket)
    else
+    process_terminal!(trainer, session, frame.sequence, frame.reward)
+    lock(sessions_lock) do
+     get(sessions, session_id, nothing) === session && delete!(sessions, session_id)
+    end
     return nothing
    end
   end
@@ -103,9 +123,9 @@ end
 
 """Serve independent Stratagus AI processor connections until lifecycle shutdown."""
 function serve(
- host::AbstractString=DEFAULT_HOST,
- port::Integer=DEFAULT_PORT;
- policy::AiPolicy=DEFAULT_POLICY,
+ host::AbstractString,
+ port::Integer;
+ trainer::OnlineTrainer,
  monitor_stdin::Bool=true,
  lifecycle_input::IO=stdin,
  listener::Union{Nothing,Sockets.TCPServer}=nothing,
@@ -115,6 +135,8 @@ function serve(
  active_lock = ReentrantLock()
  active_sockets = Set{TCPSocket}()
  active_tasks = Set{Task}()
+ sessions_lock = ReentrantLock()
+ sessions = Dict{UInt32,ClientSession}()
  monitor_stdin && errormonitor(@async monitor_lifecycle_input(lifecycle_input, server))
  try
   while isopen(server)
@@ -128,7 +150,7 @@ function serve(
     push!(active_sockets, socket)
    end
    task = @async try
-    handle_client(socket, policy)
+    handle_client(socket, trainer, sessions, sessions_lock)
    finally
     lock(active_lock) do
      delete!(active_sockets, socket)
@@ -142,18 +164,27 @@ function serve(
   end
  finally
   isopen(server) && close(server)
-  sockets, tasks = lock(active_lock) do
-   collect(active_sockets), collect(active_tasks)
+  tasks = lock(active_lock) do
+   collect(active_tasks)
+  end
+  timedwait(() -> all(istaskdone, tasks), CLIENT_SHUTDOWN_GRACE_SECONDS)
+  sockets = lock(active_lock) do
+   collect(active_sockets)
   end
   foreach(socket -> isopen(socket) && close(socket), sockets)
   foreach(wait, tasks)
+  if is_training(trainer)
+   flush_transitions!(trainer)
+   save_checkpoint!(trainer)
+  end
  end
  return nothing
 end
 
-function parse_server_args(args::AbstractVector{<:AbstractString}=ARGS)::Tuple{String,Int}
+function parse_server_args(args::AbstractVector{<:AbstractString}=ARGS)::Tuple{String,Int,Symbol}
  host = DEFAULT_HOST
  port = DEFAULT_PORT
+ mode = MODE_INFERENCE
  index = 1
  while index <= length(args)
   argument = args[index]
@@ -172,18 +203,26 @@ function parse_server_args(args::AbstractVector{<:AbstractString}=ARGS)::Tuple{S
   elseif startswith(argument, "--port=")
    port = tryparse(Int, argument[8:end])
    isnothing(port) && throw(ArgumentError("--port must be an integer"))
+  elseif argument == "--train"
+   mode == MODE_INFERENCE || throw(ArgumentError("only one training mode may be selected"))
+   mode = MODE_TRAIN
+  elseif argument == "--reset-train"
+   mode == MODE_INFERENCE || throw(ArgumentError("only one training mode may be selected"))
+   mode = MODE_RESET_TRAIN
   else
    throw(ArgumentError("unknown argument: $argument"))
   end
   index += 1
  end
  1 <= port <= typemax(UInt16) || throw(ArgumentError("port must be between 1 and 65535"))
- return host, port
+ return host, port, mode
 end
 
 function real_main(args::AbstractVector{<:AbstractString}=ARGS)::Nothing
- host, port = parse_server_args(args)
- serve(host, port)
+ host, port, mode = parse_server_args(args)
+ trainer = create_trainer(mode=mode)
+ is_training(trainer) && warmup_training_runtime!()
+ serve(host, port; trainer=trainer)
  return nothing
 end
 

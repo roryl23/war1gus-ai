@@ -9,5 +9,6 @@ incremental = "--incremental" in ARGS
   "build",
   force=true,
   cpu_target="native",
+  precompile_execution_file="precompile.jl",
   incremental=incremental,
 )
