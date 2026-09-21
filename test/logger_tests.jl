@@ -140,6 +140,17 @@ Base.flush(::BlockingLoggerIO)::Nothing = nothing
   end
 end
 
+@testset "verbose logging requires an explicit opt-in" begin
+  for value in (nothing, "", "0", "true", "01", "1 ")
+    withenv("WAR1GUS_AI_VERBOSE_LOG" => value) do
+      @test !War1gusAI.verbose_logging_enabled()
+    end
+  end
+  withenv("WAR1GUS_AI_VERBOSE_LOG" => "1") do
+    @test War1gusAI.verbose_logging_enabled()
+  end
+end
+
 
 @testset "asynchronous JSON-lines event logger" begin
   War1gusAI.stop_event_logger!()
@@ -148,7 +159,7 @@ end
   message = "quoted \" slash \\ controls \b\f\n\r\t$(Char(1)) snowman ☃ emoji 😀"
 
   try
-    @test War1gusAI.start_event_logger!(path=path, stdout_io=stdout_buffer) === nothing
+    @test War1gusAI.start_event_logger!(path=path, stdout_io=stdout_buffer, mirror_to_stdout=true) === nothing
     @test War1gusAI.log_event(
       "test_event";
       message=message,
@@ -182,7 +193,7 @@ end
 
     restart_path = tempname()
     restart_stdout = IOBuffer()
-    @test War1gusAI.start_event_logger!(path=restart_path, stdout_io=restart_stdout) === nothing
+    @test War1gusAI.start_event_logger!(path=restart_path, stdout_io=restart_stdout, mirror_to_stdout=true) === nothing
     War1gusAI.log_event("restarted"; payload=nothing)
     War1gusAI.stop_event_logger!()
     restart_stdout_lines = filter(!isempty, split(String(take!(restart_stdout)), '\n'))
@@ -199,23 +210,56 @@ end
   end
 end
 
+@testset "configured event log is not mirrored to stdout" begin
+  War1gusAI.stop_event_logger!()
+  path = tempname()
+  stdout_buffer = IOBuffer()
+  mirror_buffer = IOBuffer()
+  try
+    withenv("WAR1GUS_AI_LOG_PATH" => path) do
+      @test !War1gusAI.event_logger_mirrors_to_stdout()
+      War1gusAI.start_event_logger!(stdout_io=stdout_buffer)
+      War1gusAI.log_event("file_only"; payload="kept")
+      War1gusAI.stop_event_logger!()
+
+      @test War1gusAI.start_event_logger!(stdout_io=mirror_buffer, mirror_to_stdout=true) === nothing
+      War1gusAI.log_event("explicit_mirror")
+      War1gusAI.stop_event_logger!()
+    end
+
+    @test isempty(String(take!(stdout_buffer)))
+    file_lines = filter(!isempty, split(read(path, String), '\n'))
+    @test length(file_lines) == 2
+    @test all(is_json_line, file_lines)
+    @test any(line -> occursin("\"type\":\"file_only\"", line), file_lines)
+    @test any(line -> occursin("\"type\":\"explicit_mirror\"", line), file_lines)
+    mirror_lines = filter(!isempty, split(String(take!(mirror_buffer)), '\n'))
+    @test length(mirror_lines) == 1
+    @test occursin("\"type\":\"explicit_mirror\"", only(mirror_lines))
+  finally
+    War1gusAI.stop_event_logger!()
+    rm(path; force=true)
+  end
+end
+
 @testset "event logger reports unavailable file" begin
   War1gusAI.stop_event_logger!()
   mktempdir() do directory
     stdout_buffer = IOBuffer()
     try
-      War1gusAI.start_event_logger!(path=directory, stdout_io=stdout_buffer)
-      War1gusAI.log_event("survives_file_error")
-      War1gusAI.stop_event_logger!()
-      +
+      withenv("WAR1GUS_AI_LOG_PATH" => directory) do
+        War1gusAI.start_event_logger!(stdout_io=stdout_buffer)
+        War1gusAI.log_event("survives_file_error")
+        War1gusAI.stop_event_logger!()
+      end
+
       lines = filter(!isempty, split(String(take!(stdout_buffer)), '\n'))
-      @test length(lines) == 2
+      @test length(lines) == 1
       @test all(is_json_line, lines)
       error_line = only(filter(line -> occursin("\"type\":\"logger_error\"", line), lines))
       @test occursin("\"operation\":\"open\"", error_line)
       @test occursin("\"path\":\"$(directory)\"", error_line)
       @test occursin("\"error\":\"", error_line)
-      @test any(line -> occursin("\"type\":\"survives_file_error\"", line), lines)
     finally
       War1gusAI.stop_event_logger!()
     end
@@ -229,7 +273,7 @@ end
   logger = nothing
 
   try
-    @test War1gusAI.start_event_logger!(path=path, stdout_io=stdout_io) === nothing
+    @test War1gusAI.start_event_logger!(path=path, stdout_io=stdout_io, mirror_to_stdout=true) === nothing
     logger = War1gusAI.EVENT_LOGGER[]
     @test !isnothing(logger)
     War1gusAI.log_event("blocked_writer")

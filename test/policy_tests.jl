@@ -143,24 +143,63 @@ end
     first_terminal = v3_state(player=10, candidates=Vector{UInt32}[], terminal_reward=101)
     second_terminal = v3_state(player=11, candidates=Vector{UInt32}[], terminal_reward=202)
 
-    War1gusAI.start_event_logger!(; path=log_path, stdout_io=devnull)
-    try
-      War1gusAI.process_step!(trainer, first, UInt32(0), Int32(0), first_live)
-      War1gusAI.process_step!(trainer, second, UInt32(0), Int32(0), second_live)
-      @test War1gusAI.process_terminal!(trainer, first, UInt32(1), Int32(101), first_terminal)
-      @test !War1gusAI.process_terminal!(trainer, first, UInt32(1), Int32(101), first_terminal)
-      @test !second.finalized
-      War1gusAI.process_step!(trainer, second, UInt32(1), Int32(31), second_live)
-      @test only(second.fragment).reward == 31.0f0
-      @test War1gusAI.process_terminal!(trainer, second, UInt32(2), Int32(202), second_terminal)
-    finally
-      War1gusAI.stop_event_logger!()
+    withenv("WAR1GUS_AI_VERBOSE_LOG" => "1") do
+      War1gusAI.start_event_logger!(; path=log_path, stdout_io=devnull)
+      try
+        War1gusAI.process_step!(trainer, first, UInt32(0), Int32(0), first_live)
+        War1gusAI.process_step!(trainer, second, UInt32(0), Int32(0), second_live)
+        @test War1gusAI.process_terminal!(trainer, first, UInt32(1), Int32(101), first_terminal)
+        @test !War1gusAI.process_terminal!(trainer, first, UInt32(1), Int32(101), first_terminal)
+        @test !second.finalized
+        War1gusAI.process_step!(trainer, second, UInt32(1), Int32(31), second_live)
+        @test only(second.fragment).reward == 31.0f0
+        @test War1gusAI.process_terminal!(trainer, second, UInt32(2), Int32(202), second_terminal)
+      finally
+        War1gusAI.stop_event_logger!()
+      end
+
+      samples = filter(record -> occursin("\"type\":\"training_sample\"", record), readlines(log_path))
+      @test count(record -> occursin("\"session_id\":10", record) && occursin("\"reward\":101", record) && occursin("\"terminal\":true", record), samples) == 1
+      @test count(record -> occursin("\"session_id\":11", record) && occursin("\"reward\":202", record) && occursin("\"terminal\":true", record), samples) == 1
+      @test count(record -> occursin("\"session_id\":11", record), samples) == 2
+      @test all(record -> occursin("\"state\":[", record), samples)
+      @test any(record -> occursin("\"next_state\":[", record), samples)
+    end
+  end
+end
+
+@testset "training samples are verbose-only diagnostics" begin
+  mktempdir() do directory
+    checkpoint_path = joinpath(directory, "compact.jls")
+    log_path = joinpath(directory, "events.jsonl")
+    trainer = War1gusAI.create_trainer(
+      mode=War1gusAI.MODE_TRAIN,
+      checkpoint_path=checkpoint_path,
+      seed=41,
+      batch_size=32,
+      rollout_fragment=32,
+      ppo_epochs=1,
+      checkpoint_every=100,
+    )
+    session = War1gusAI.ClientSession()
+    live = v3_state(player=12, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=7, actor=1)])
+    terminal = v3_state(player=12, candidates=Vector{UInt32}[], terminal_reward=17)
+
+    withenv("WAR1GUS_AI_VERBOSE_LOG" => nothing) do
+      War1gusAI.start_event_logger!(path=log_path, stdout_io=devnull, mirror_to_stdout=false)
+      try
+        War1gusAI.process_step!(trainer, session, UInt32(0), Int32(0), live)
+        @test War1gusAI.process_terminal!(trainer, session, UInt32(1), Int32(17), terminal)
+      finally
+        War1gusAI.stop_event_logger!()
+      end
     end
 
-    samples = filter(record -> occursin("\"type\":\"training_sample\"", record), readlines(log_path))
-    @test count(record -> occursin("\"session_id\":10", record) && occursin("\"reward\":101", record) && occursin("\"terminal\":true", record), samples) == 1
-    @test count(record -> occursin("\"session_id\":11", record) && occursin("\"reward\":202", record) && occursin("\"terminal\":true", record), samples) == 1
-    @test count(record -> occursin("\"session_id\":11", record), samples) == 2
+    records = readlines(log_path)
+    @test !any(record -> occursin("\"type\":\"training_sample\"", record), records)
+    @test !any(record -> occursin("\"type\":\"reward_decomposition\"", record), records)
+    @test !any(record -> occursin("\"state\":[", record), records)
+    @test any(record -> occursin("\"type\":\"episode_finalized\"", record), records)
   end
 end
 

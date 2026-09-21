@@ -127,7 +127,8 @@ function handle_client(
   init = read_exact(socket, 2)
   isnothing(init) && return nothing
   validate_init_frame(init)
-  log_event("network_request"; request_kind="init", protocol_version=Int(PROTOCOL_VERSION))
+  verbose_logging_enabled() &&
+   log_event("network_request"; request_kind="init", protocol_version=Int(PROTOCOL_VERSION))
 
   while true
    prefix_bytes = read_exact(socket, 1)
@@ -142,41 +143,47 @@ function handle_client(
    end
 
    if prefix == STEP_PREFIX
-    log_event(
-     "network_request";
-     request_kind="step",
-     player=Int(player),
-     sequence=frame.sequence,
-     reward=frame.reward,
-     word_count=length(frame.state),
-     candidate_count=frame.candidate_count,
-     reward_components=reward_components(frame.state),
-    )
+    if verbose_logging_enabled()
+     log_event(
+      "network_request";
+      request_kind="step",
+      player=Int(player),
+      sequence=frame.sequence,
+      reward=frame.reward,
+      word_count=length(frame.state),
+      candidate_count=frame.candidate_count,
+      reward_components=reward_components(frame.state),
+     )
+    end
     action = process_step!(trainer, session, frame.sequence, frame.reward, frame.state)
     0 <= action < frame.candidate_count ||
      throw(ArgumentError("policy returned candidate index $action outside 0:$(frame.candidate_count-1)"))
     write_u32_be(socket, UInt32(action))
     flush(socket)
-    log_event(
-     "network_response";
-     request_kind="step",
-     player=Int(player),
-     sequence=frame.sequence,
-     candidate_index=action,
-     candidate_kind=_candidate_kind_for_log(frame, action),
-     candidate_count=frame.candidate_count,
-    )
+    if verbose_logging_enabled()
+     log_event(
+      "network_response";
+      request_kind="step",
+      player=Int(player),
+      sequence=frame.sequence,
+      candidate_index=action,
+      candidate_kind=_candidate_kind_for_log(frame, action),
+      candidate_count=frame.candidate_count,
+     )
+    end
    else
-    log_event(
-     "network_request";
-     request_kind="end",
-     player=Int(player),
-     sequence=frame.sequence,
-     reward=frame.reward,
-     word_count=length(frame.state),
-     candidate_count=frame.candidate_count,
-     reward_components=reward_components(frame.state),
-    )
+    if verbose_logging_enabled()
+     log_event(
+      "network_request";
+      request_kind="end",
+      player=Int(player),
+      sequence=frame.sequence,
+      reward=frame.reward,
+      word_count=length(frame.state),
+      candidate_count=frame.candidate_count,
+      reward_components=reward_components(frame.state),
+     )
+    end
     finalized = process_terminal!(trainer, session, frame.sequence, frame.reward, frame.state)
     lock(sessions_lock) do
      finalized && push!(completed_players, player)

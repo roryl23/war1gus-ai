@@ -11,6 +11,7 @@ mutable struct EventLogger
   stopping::Bool
   path::String
   stdout_io::IO
+  mirror_to_stdout::Bool
   task::Union{Nothing,Task}
 end
 
@@ -19,6 +20,12 @@ function default_log_path()::String
   path = get(ENV, "WAR1GUS_AI_LOG_PATH", "")
   return isempty(path) ? joinpath(Sys.BINDIR, "War1gusAI.log") : path
 end
+
+"""Return whether verbose diagnostic logging is explicitly enabled."""
+@inline verbose_logging_enabled()::Bool = get(ENV, "WAR1GUS_AI_VERBOSE_LOG", "") == "1"
+
+"""Return whether normal events should be mirrored to stdout."""
+@inline event_logger_mirrors_to_stdout()::Bool = isempty(get(ENV, "WAR1GUS_AI_LOG_PATH", ""))
 
 @inline function _json_hex_digit(value::UInt32)::UInt8
   return value < 10 ? UInt8('0') + UInt8(value) : UInt8('a') + UInt8(value - 10)
@@ -190,10 +197,12 @@ function _write_event_lines!(logger::EventLogger)::Nothing
             file_io = nothing
           end
         end
-        try
-          write(logger.stdout_io, line)
-          write(logger.stdout_io, UInt8('\n'))
-        catch
+        if logger.mirror_to_stdout
+          try
+            write(logger.stdout_io, line)
+            write(logger.stdout_io, UInt8('\n'))
+          catch
+          end
         end
       end
       if !isnothing(file_io)
@@ -208,9 +217,11 @@ function _write_event_lines!(logger::EventLogger)::Nothing
           file_io = nothing
         end
       end
-      try
-        flush(logger.stdout_io)
-      catch
+      if logger.mirror_to_stdout
+        try
+          flush(logger.stdout_io)
+        catch
+        end
       end
     end
   finally
@@ -226,9 +237,11 @@ function _write_event_lines!(logger::EventLogger)::Nothing
         _report_file_error!(logger, "close", error)
       end
     end
-    try
-      flush(logger.stdout_io)
-    catch
+    if logger.mirror_to_stdout
+      try
+        flush(logger.stdout_io)
+      catch
+      end
     end
   end
   return nothing
@@ -249,7 +262,11 @@ function _stop_event_logger!(logger::EventLogger)::Nothing
 end
 
 """Start a background JSON-lines logger, replacing and draining any prior logger."""
-function start_event_logger!(; path::AbstractString=default_log_path(), stdout_io::IO=stdout)::Nothing
+function start_event_logger!(;
+  path::AbstractString=default_log_path(),
+  stdout_io::IO=stdout,
+  mirror_to_stdout::Bool=event_logger_mirrors_to_stdout(),
+)::Nothing
   lock(EVENT_LOGGER_LIFECYCLE_LOCK)
   try
     lock(EVENT_LOGGER_LOCK)
@@ -270,6 +287,7 @@ function start_event_logger!(; path::AbstractString=default_log_path(), stdout_i
       false,
       String(path),
       stdout_io,
+      mirror_to_stdout,
       nothing,
     )
     lock(EVENT_LOGGER_LOCK)

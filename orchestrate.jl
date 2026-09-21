@@ -345,12 +345,20 @@ const TERMINAL_NUMERIC_FIELDS = (
  "units", "buildings", "total_units", "total_buildings",
 )
 
-function collect_child_events(lines)
+function collect_events_of_type(lines, event_type::AbstractString)
  events = Dict{String,Any}[]
  for line in lines
   event = child_json_object(line)
-  event === nothing || push!(events, event)
+  event === nothing && continue
+  event["type"] == event_type && push!(events, event)
  end
+ return events
+end
+
+function collect_result_events(paths)
+ events = collect_events_of_type(eachline(paths.child_log), "rollout_terminal")
+ isfile(paths.ai_log) || return events
+ append!(events, collect_events_of_type(eachline(paths.ai_log), "error"))
  return events
 end
 
@@ -484,10 +492,7 @@ function run_one_match(options, match, output, output_lock)
    status = error isa ProcessFailedException ? first(error.procs).exitcode : 1
   end
  end
- events = collect_child_events(eachline(paths.child_log))
- for event in events
-  emit!(output, output_lock, "child_stdout"; match_id=match.match_id, child_type=event["type"], event=event)
- end
+ events = collect_result_events(paths)
  if status != 0
   emit!(output, output_lock, "child_failure"; match_id=match.match_id, exit_code=status, log_path=paths.child_log)
   throw(ErrorException("launcher failed for $(match.match_id) with exit code $status"))

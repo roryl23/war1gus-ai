@@ -792,6 +792,7 @@ function _log_training_step(
  next_state::Union{Nothing,Vector{UInt32}},
  terminal::Bool,
 )::Nothing
+ verbose_logging_enabled() || return nothing
  log_event(
   "training_sample";
   session_id=Int(player_of(decision.state)),
@@ -812,6 +813,7 @@ function _log_reward_decomposition(
  reward::Int32,
  terminal::Bool,
 )::Nothing
+ verbose_logging_enabled() || return nothing
  components = reward_components(state)
  log_event(
   "reward_decomposition";

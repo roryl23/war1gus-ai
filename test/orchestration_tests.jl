@@ -83,13 +83,8 @@ end
   total_buildings=3,
   outcome="win",
  )
- events = collect_child_events(["engine noise", terminal_line])
- @test require_rollout_terminal(events, match)["outcome"] == "win"
- @test_throws ArgumentError require_rollout_terminal(Dict{String,Any}[], match)
- @test_throws ArgumentError require_rollout_terminal(collect_child_events([terminal_line, terminal_line]), match)
+ large_diagnostic_line = json_line("training_sample"; payload=repeat("diagnostic", 10_000))
  fatal_line = json_line("error"; error="incompatible checkpoint")
- @test_throws ArgumentError require_rollout_terminal(collect_child_events([terminal_line, fatal_line]), match)
-
  incomplete_line = json_line(
   "rollout_terminal";
   match_id=match.match_id,
@@ -107,7 +102,38 @@ end
   total_units=7,
   outcome="win",
  )
- @test_throws ArgumentError require_rollout_terminal(collect_child_events([incomplete_line]), match)
+ write_log = function (path, lines)
+  open(path, "w") do io
+   for line in lines
+    println(io, line)
+   end
+  end
+ end
+ mktempdir() do root
+  paths = (; child_log=joinpath(root, "launcher.log"), ai_log=joinpath(root, "ai.jsonl"))
+  write_log(paths.child_log, ["engine noise", large_diagnostic_line, terminal_line])
+  write_log(paths.ai_log, [large_diagnostic_line, terminal_line])
+  events = collect_result_events(paths)
+  @test [event["type"] for event in events] == ["rollout_terminal"]
+  @test require_rollout_terminal(events, match)["outcome"] == "win"
+  @test_throws ArgumentError require_rollout_terminal(Dict{String,Any}[], match)
+
+  write_log(paths.ai_log, [large_diagnostic_line, terminal_line, fatal_line])
+  retained = collect_result_events(paths)
+  @test [event["type"] for event in retained] == ["rollout_terminal", "error"]
+  @test_throws ArgumentError require_rollout_terminal(retained, match)
+
+  write_log(paths.ai_log, String[])
+  write_log(paths.child_log, [terminal_line, terminal_line])
+  @test_throws ArgumentError require_rollout_terminal(collect_result_events(paths), match)
+
+  write_log(paths.child_log, [terminal_line])
+  rm(paths.ai_log)
+  @test [event["type"] for event in collect_result_events(paths)] == ["rollout_terminal"]
+
+  write_log(paths.child_log, [incomplete_line])
+  @test_throws ArgumentError require_rollout_terminal(collect_result_events(paths), match)
+ end
 end
 
 @testset "child environment preserves runtime variables without loader overrides" begin

@@ -138,21 +138,32 @@ snapshot instead of sampling the checkpoint's sibling `league/` directory.
 Asset value is each non-wall unit or building's gold-plus-wood cost multiplied
 by remaining-health fraction. Enemy asset loss produces positive progress,
 own asset loss and elapsed-time buckets are negative, and victory or defeat
-adds the terminal reward component. Lua logs these components; the AI logs
-network requests and responses, selected candidates, training samples, PPO
-updates, league assignments and snapshots, and episode finalization as JSON
-records with a `type` field.
+adds the terminal reward component. Logging is compact by default: Julia emits
+errors, server lifecycle, trainer and league configuration, league assignments
+and snapshots, PPO updates, and episode finalization as JSON records with a
+`type` field. Lua keeps
+lifecycle, terminal, and error records available. Set
+`WAR1GUS_AI_VERBOSE_LOG=1` to also emit high-frequency diagnostics: Julia
+`network_request`, `network_response`, `reward_decomposition`, and complete
+`training_sample` events, plus Lua reward and action records.
+
+Full `training_sample` records are diagnostics, not a training-data format.
+PPO trains synchronously from in-memory trajectories and persists its state in
+checkpoints; it does not replay JSONL logs.
 
 For coordinator runs, live files are under that invocation's run directory:
 
 - The coordinator stream is
   `$AI_ROOT/ai-training/runs/<run-id>/train.jsonl` or
-  `$AI_ROOT/ai-evaluation/runs/<run-id>/evaluate.jsonl`.
+  `$AI_ROOT/ai-evaluation/runs/<run-id>/evaluate.jsonl`. It contains the
+  schedule and match results, not copied child event streams.
 - Each match has
   `$AI_ROOT/ai-training/runs/<run-id>/matches/<match-id>/ai.jsonl` (or the
   equivalent evaluation path) for AI JSON events.
-- The coordinator redirects **both child stdout and stderr** to that match's
-  `launcher.log`; this includes engine output and the AI's stdout JSON events.
+- Each match's `launcher.log` receives child launcher output. The coordinator
+  scans it for `rollout_terminal` records and that match's `ai.jsonl` for fatal
+  `error` records required to validate the match; it never re-emits parsed child
+  events as `child_stdout`.
 
 To follow logs for training match directories that already exist, run:
 
@@ -164,4 +175,6 @@ tail -q -f "$AI_ROOT"/ai-training/runs/*/matches/*/ai.jsonl \
 The shell expands this glob before `tail` starts, so it sees only match
 directories that exist when invoked; re-run it to include later matches. For a
 direct, non-coordinated AI launch, set `WAR1GUS_AI_LOG_PATH` to choose the JSON
-log file; otherwise the application chooses its default log location.
+log file. When it is set, Julia writes events only to that file and does not
+mirror them to stdout; otherwise the application chooses its default log
+location.
