@@ -114,12 +114,12 @@ function is_json_line(line::AbstractString)::Bool
   return json_value_end(bytes, 1) == length(bytes) + 1
 end
 mutable struct BlockingLoggerIO <: IO
-  entered::Base.Event
+  entered::Channel{Nothing}
   release::Base.Event
 end
 
 function Base.write(io::BlockingLoggerIO, value::String)::Int
-  notify(io.entered)
+  put!(io.entered, nothing)
   wait(io.release)
   return ncodeunits(value)
 end
@@ -202,7 +202,7 @@ end
 @testset "event logger bounded shutdown" begin
   War1gusAI.stop_event_logger!()
   path = tempname()
-  stdout_io = BlockingLoggerIO(Base.Event(), Base.Event())
+  stdout_io = BlockingLoggerIO(Channel{Nothing}(1), Base.Event())
   logger = nothing
 
   try
@@ -210,7 +210,7 @@ end
     logger = War1gusAI.EVENT_LOGGER[]
     @test !isnothing(logger)
     War1gusAI.log_event("blocked_writer")
-    wait(stdout_io.entered)
+    @test timedwait(() -> isready(stdout_io.entered), 5.0) == :ok
 
     elapsed = @elapsed War1gusAI.stop_event_logger!()
     @test elapsed < War1gusAI.EVENT_LOGGER_SHUTDOWN_TIMEOUT_SECONDS + 2.0
@@ -218,7 +218,9 @@ end
   finally
     notify(stdout_io.release)
     War1gusAI.stop_event_logger!()
-    !isnothing(logger) && wait(logger.task)
+    if !isnothing(logger)
+      @test timedwait(() -> istaskdone(logger.task), 5.0) == :ok
+    end
     rm(path; force=true)
   end
 end
