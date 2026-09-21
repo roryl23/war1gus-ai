@@ -3,30 +3,82 @@ using Random
 using Serialization
 using Statistics
 
-const STATE_DIM = 18
-const ACTION_DIM = 10
+const STATE_DIM = 34
+const FEATURE_DIM = 32
+const ACTION_DIM = 24
 const EMBED_DIM = 48
 const NUM_HEADS = 4
 const HIDDEN_DIM = 96
 const TOKEN_COUNT = 3
+const CATALOG_VERSION = 2
+const REWARD_VERSION = 2
+const LEGAL_MASK_ENCODING = "u32-low-high-words-33-34"
+const VALID_ACTION_MASK = (UInt64(1) << ACTION_DIM) - UInt64(1)
 
-const ACTION_ECONOMY = 0
-const ACTION_SUPPLY = 1
-const ACTION_INFRASTRUCTURE = 2
-const ACTION_BLACKSMITH = 3
-const ACTION_BASIC_FORCE = 4
-const ACTION_CAVALRY_FORCE = 5
-const ACTION_SIEGE_FORCE = 6
-const ACTION_ATTACK = 7
-const ACTION_RESEARCH = 8
-const ACTION_DEFEND = 9
+const ACTION_WAIT = 0
+const ACTION_GATHER_GOLD = 1
+const ACTION_GATHER_WOOD = 2
+const ACTION_BUILD_TOWN_HALL = 3
+const ACTION_TRAIN_WORKER = 4
+const ACTION_BUILD_FARM = 5
+const ACTION_BUILD_BARRACKS = 6
+const ACTION_BUILD_LUMBER_MILL = 7
+const ACTION_BUILD_BLACKSMITH = 8
+const ACTION_BUILD_STABLES = 9
+const ACTION_TRAIN_SOLDIER = 10
+const ACTION_TRAIN_SHOOTER = 11
+const ACTION_TRAIN_CAVALRY = 12
+const ACTION_TRAIN_CATAPULT = 13
+const ACTION_RESEARCH_WEAPON = 14
+const ACTION_RESEARCH_ARMOR = 15
+const ACTION_ATTACK_NEAREST_UNIT = 16
+const ACTION_ATTACK_NEAREST_BUILDING = 17
+const ACTION_ATTACK_WEAKEST_UNIT = 18
+const ACTION_ATTACK_WEAKEST_BUILDING = 19
+const ACTION_DEFEND_BASE = 20
+const ACTION_EXPLORE = 21
+const ACTION_PREPARE_BUILDING_SPACE = 22
+const ACTION_REPAIR_BUILDING = 23
+
+const ACTION_NAMES = (
+ "wait",
+ "gather-gold",
+ "gather-wood",
+ "build-town-hall",
+ "train-worker",
+ "build-farm",
+ "build-barracks",
+ "build-lumber-mill",
+ "build-blacksmith",
+ "build-stables",
+ "train-soldier",
+ "train-shooter",
+ "train-cavalry",
+ "train-catapult",
+ "research-weapon",
+ "research-armor",
+ "attack-nearest-unit",
+ "attack-nearest-building",
+ "attack-weakest-unit",
+ "attack-weakest-building",
+ "defend-base",
+ "explore",
+ "prepare-building-space",
+ "repair-building",
+)
 
 const MODE_INFERENCE = :inference
 const MODE_TRAIN = :train
 const MODE_RESET_TRAIN = :reset_train
-const CHECKPOINT_VERSION = 2
+const CHECKPOINT_VERSION = 3
 const DEFAULT_BATCH_SIZE = 32
 const DEFAULT_CHECKPOINT_EVERY = 32
+
+"""Return the stable name for a zero-based primitive action ID."""
+function action_name(action::Integer)::String
+ 0 <= action < ACTION_DIM || throw(ArgumentError("action $action is outside the AI action range"))
+ return ACTION_NAMES[Int(action)+1]
+end
 
 """State encoder, self-attention block, policy head, and scalar value head."""
 struct AiPolicy
@@ -44,7 +96,7 @@ function create_policy(; seed::Integer=0x574131)
  rng = MersenneTwister(seed)
  init = (dimensions...) -> Flux.glorot_uniform(rng, dimensions...)
  return AiPolicy(
-  Dense(STATE_DIM => EMBED_DIM, tanh; init),
+  Dense(FEATURE_DIM => EMBED_DIM, tanh; init),
   Dense(EMBED_DIM => TOKEN_COUNT * EMBED_DIM, tanh; init),
   Flux.MultiHeadAttention(EMBED_DIM; nheads=NUM_HEADS, dropout_prob=0.0f0, init),
   Chain(Dense(EMBED_DIM => HIDDEN_DIM, relu; init), Dense(HIDDEN_DIM => EMBED_DIM; init)),
@@ -53,19 +105,34 @@ function create_policy(; seed::Integer=0x574131)
  )
 end
 
+"""Validate a complete v2 producer state including its nonempty legal-action mask."""
 function validate_state(state::AbstractVector{<:Integer})::Nothing
  length(state) == STATE_DIM || throw(ArgumentError("AI state has $(length(state)) fields, expected $STATE_DIM"))
- UInt32(state[1]) == UInt32(1) || throw(ArgumentError("unsupported AI state protocol version $(state[1])"))
+ UInt32(state[1]) == UInt32(2) || throw(ArgumentError("unsupported AI state protocol version $(state[1])"))
+ mask = legal_mask(state)
+ mask != 0 || throw(ArgumentError("AI state has no legal actions"))
+ (mask & ~VALID_ACTION_MASK) == 0 || throw(ArgumentError("AI state has action bits outside the catalog"))
+ (mask & UInt64(1)) != 0 || throw(ArgumentError("AI state must allow wait"))
  return nothing
 end
 
-"""Map unsigned protocol counters to a bounded, compact model input."""
+"""Decode the producer's low/high UInt32 legality words into a zero-based action mask."""
+function legal_mask(state::AbstractVector{<:Integer})::UInt64
+ length(state) == STATE_DIM || throw(ArgumentError("AI state has $(length(state)) fields, expected $STATE_DIM"))
+ return UInt64(UInt32(state[33])) | (UInt64(UInt32(state[34])) << 32)
+end
+
+@inline function is_legal_action(state::AbstractVector{<:Integer}, action::Integer)::Bool
+ return 0 <= action < ACTION_DIM && (legal_mask(state) & (UInt64(1) << action)) != 0
+end
+
+"""Map the 32 model features, excluding producer-owned legality words, to bounded inputs."""
 function encode_state(state::AbstractVector{<:Integer})::Vector{Float32}
  validate_state(state)
- values = Float32.(state)
+ values = Float32.(state[1:FEATURE_DIM])
  scales = Float32[
-  1, 7, 1, 20_000, 2_000, 2_000, 100, 100, 50,
-  10, 10, 10, 10, 10, 50, 50, 50, 50,
+  2, 7, 1, 20_000, 2_000, 2_000, 100, 100, 50, 10, 10, 10, 10, 10, 50, 50,
+  50, 50, 100, 100, 50, 50, 50, 10, 10, 10, 10, 10, 50, 50, 50, 50,
  ]
  return clamp.(values ./ scales, 0.0f0, 4.0f0)
 end
@@ -80,7 +147,8 @@ function policy_features(policy::AiPolicy, state::AbstractVector{<:Integer})
 end
 
 function action_logits(policy::AiPolicy, state::AbstractVector{<:Integer})::Vector{Float32}
- return clamp.(Float32.(policy.action_head(policy_features(policy, state))), -1.0f0, 1.0f0)
+ validate_state(state)
+ return Float32.(policy.action_head(policy_features(policy, state)))
 end
 
 function value_estimate(policy::AiPolicy, state::AbstractVector{<:Integer})::Float32
@@ -89,62 +157,56 @@ end
 
 @inline state_count(state::AbstractVector{<:Integer}, index::Integer) = Int(state[index])
 
-"""Mask unavailable actions and return small biases among strategic choices."""
-function action_priors(state::AbstractVector{<:Integer})::NTuple{ACTION_DIM,Float32}
+"""Small low-level bootstrap preferences; legality always remains producer-owned."""
+function action_bootstrap_biases(state::AbstractVector{<:Integer})::NTuple{ACTION_DIM,Float32}
  validate_state(state)
-
  gold = state_count(state, 5)
  wood = state_count(state, 6)
  supply = state_count(state, 7)
  demand = state_count(state, 8)
  workers = state_count(state, 9)
+ town_halls = state_count(state, 10)
  barracks = state_count(state, 11)
  lumber_mills = state_count(state, 12)
  blacksmiths = state_count(state, 13)
  stables = state_count(state, 14)
- soldiers = state_count(state, 15)
- shooters = state_count(state, 16)
- cavalry = state_count(state, 17)
- catapults = state_count(state, 18)
- basic_force = soldiers + shooters
- army = basic_force + cavalry + catapults
+ combatants = sum(state_count(state, index) for index in 15:18)
+ enemy_units = state_count(state, 21)
+ enemy_buildings = state_count(state, 22)
 
- forced_action = if demand + 2 >= supply
-  ACTION_SUPPLY
- elseif workers < 5 || (gold < 250 && wood < 100)
-  ACTION_ECONOMY
- elseif barracks == 0 || lumber_mills == 0
-  ACTION_INFRASTRUCTURE
- elseif basic_force < 4
-  ACTION_BASIC_FORCE
- elseif blacksmiths == 0
-  ACTION_BLACKSMITH
- elseif stables == 0
-  ACTION_INFRASTRUCTURE
- else
-  nothing
+ return ntuple(ACTION_DIM) do index
+  action = index - 1
+  action == ACTION_GATHER_GOLD && workers > 0 ? (gold < wood ? 0.9f0 : 0.7f0) :
+  action == ACTION_GATHER_WOOD && workers > 0 ? (wood < gold ? 0.9f0 : 0.7f0) :
+  action == ACTION_BUILD_TOWN_HALL && town_halls == 0 ? 3.0f0 :
+  action == ACTION_TRAIN_WORKER && workers < 5 ? 2.0f0 :
+  action == ACTION_BUILD_FARM && demand + 2 >= supply ? 2.5f0 :
+  action == ACTION_BUILD_BARRACKS && barracks == 0 ? 1.8f0 :
+  action == ACTION_BUILD_LUMBER_MILL && lumber_mills == 0 ? 1.7f0 :
+  action == ACTION_BUILD_BLACKSMITH && blacksmiths == 0 ? 1.6f0 :
+  action == ACTION_BUILD_STABLES && stables == 0 ? 1.5f0 :
+  action == ACTION_TRAIN_SOLDIER && barracks > 0 && combatants < 8 ? 1.0f0 :
+  action == ACTION_TRAIN_SHOOTER && lumber_mills > 0 && combatants < 8 ? 0.9f0 :
+  action == ACTION_TRAIN_CAVALRY && stables > 0 ? 0.8f0 :
+  action == ACTION_TRAIN_CATAPULT && blacksmiths > 0 ? 0.8f0 :
+  action == ACTION_PREPARE_BUILDING_SPACE &&
+   (barracks == 0 || lumber_mills == 0 || blacksmiths == 0 || stables == 0) ? 2.2f0 :
+  action == ACTION_ATTACK_NEAREST_UNIT && combatants > 0 && enemy_units > 0 ? 1.4f0 :
+  action == ACTION_ATTACK_NEAREST_BUILDING && combatants > 0 && enemy_buildings > 0 ? 1.3f0 :
+  0.0f0
  end
- if !isnothing(forced_action)
-  return ntuple(index -> index == forced_action + 1 ? 0.0f0 : -Inf32, ACTION_DIM)
- end
-
- return (
-  0.0f0,
-  -0.2f0,
-  -Inf32,
-  -Inf32,
-  0.1f0,
-  cavalry < 2 ? 0.2f0 : 0.0f0,
-  catapults < 1 ? 0.2f0 : 0.0f0,
-  army >= 6 ? 0.2f0 : -Inf32,
-  0.0f0,
-  0.0f0,
- )
 end
 
-"""Combine transformer logits with immutable legality and progression priors."""
+"""Mask scores with producer authority. Masked actions are never selectable."""
+function mask_action_scores(scores::AbstractVector{<:AbstractFloat}, state::AbstractVector{<:Integer})::Vector{Float32}
+ length(scores) == ACTION_DIM || throw(ArgumentError("AI action scores have $(length(scores)) entries, expected $ACTION_DIM"))
+ validate_state(state)
+ legality = ntuple(index -> is_legal_action(state, index - 1), ACTION_DIM)
+ return Float32.(ifelse.(legality, scores, -Inf32))
+end
+
 function action_scores(policy::AiPolicy, state::AbstractVector{<:Integer})::Vector{Float32}
- return action_logits(policy, state) .+ action_priors(state)
+ return mask_action_scores(action_logits(policy, state) .+ action_bootstrap_biases(state), state)
 end
 
 function legal_action_distribution(policy::AiPolicy, state::AbstractVector{<:Integer})
@@ -167,7 +229,7 @@ function sample_legal_action(scores::AbstractVector{<:AbstractFloat}, rng::Abstr
  return legal[end] - 1
 end
 
-"""Choose greedily for inference, or sample only legal actions during training."""
+"""Choose greedily for inference, or sample only producer-legal actions during training."""
 function select_action(
  policy::AiPolicy,
  state::AbstractVector{<:Integer};
@@ -188,7 +250,11 @@ function checkpoint_payload(policy::AiPolicy, optimizer_state, update_count::Int
  return (
   version=CHECKPOINT_VERSION,
   state_dim=STATE_DIM,
+  feature_dim=FEATURE_DIM,
   action_dim=ACTION_DIM,
+  catalog_version=CATALOG_VERSION,
+  reward_version=REWARD_VERSION,
+  mask_encoding=LEGAL_MASK_ENCODING,
   update_count=Int(update_count),
   model_state=Flux.state(policy),
   optimizer_state=optimizer_state,
@@ -222,15 +288,34 @@ function load_policy_checkpoint!(path::AbstractString, policy::AiPolicy, fresh_o
  isfile(path) || return (update_count=0, optimizer_state=fresh_optimizer_state)
  payload = open(deserialize, path)
  payload isa NamedTuple || throw(ArgumentError("AI checkpoint has an invalid format"))
- required = (:version, :state_dim, :action_dim, :update_count, :model_state, :optimizer_state)
+ required = (
+  :version,
+  :state_dim,
+  :feature_dim,
+  :action_dim,
+  :catalog_version,
+  :reward_version,
+  :mask_encoding,
+  :update_count,
+  :model_state,
+  :optimizer_state,
+ )
  all(field -> hasproperty(payload, field), required) ||
-  throw(ArgumentError("AI checkpoint is missing required metadata"))
+  throw(ArgumentError("AI checkpoint is missing v3 compatibility metadata"))
  payload.version == CHECKPOINT_VERSION ||
   throw(ArgumentError("AI checkpoint version $(payload.version) is unsupported"))
  Int(payload.state_dim) == STATE_DIM ||
   throw(ArgumentError("AI checkpoint state dimension $(payload.state_dim) does not match $STATE_DIM"))
+ Int(payload.feature_dim) == FEATURE_DIM ||
+  throw(ArgumentError("AI checkpoint feature dimension $(payload.feature_dim) does not match $FEATURE_DIM"))
  Int(payload.action_dim) == ACTION_DIM ||
   throw(ArgumentError("AI checkpoint action dimension $(payload.action_dim) does not match $ACTION_DIM"))
+ Int(payload.catalog_version) == CATALOG_VERSION ||
+  throw(ArgumentError("AI checkpoint catalog version $(payload.catalog_version) is unsupported"))
+ Int(payload.reward_version) == REWARD_VERSION ||
+  throw(ArgumentError("AI checkpoint reward version $(payload.reward_version) is unsupported"))
+ payload.mask_encoding == LEGAL_MASK_ENCODING ||
+  throw(ArgumentError("AI checkpoint mask encoding $(repr(payload.mask_encoding)) is unsupported"))
  payload.update_count isa Integer && payload.update_count >= 0 ||
   throw(ArgumentError("AI checkpoint has an invalid update count"))
  typeof(payload.optimizer_state) == typeof(fresh_optimizer_state) ||
@@ -251,8 +336,30 @@ end
 struct Transition
  state::Vector{UInt32}
  action::Int
+ legal_mask::UInt64
  reward::Int32
  next_state::Union{Nothing,Vector{UInt32}}
+ next_legal_mask::Union{Nothing,UInt64}
+end
+
+function Transition(
+ state::Vector{UInt32},
+ action::Integer,
+ reward::Int32,
+ next_state::Union{Nothing,Vector{UInt32}},
+)
+ validate_state(state)
+ 0 <= action < ACTION_DIM || throw(ArgumentError("action $action is outside the AI action range"))
+ is_legal_action(state, action) || throw(ArgumentError("action $action is not legal for this AI state"))
+ !isnothing(next_state) && validate_state(next_state)
+ return Transition(
+  state,
+  Int(action),
+  legal_mask(state),
+  reward,
+  next_state,
+  isnothing(next_state) ? nothing : legal_mask(next_state),
+ )
 end
 
 mutable struct OnlineTrainer{O,R<:AbstractRNG}
@@ -494,9 +601,12 @@ function process_step!(
     session_id=previous_state[2],
     sequence,
     state=previous_state,
+    legal_mask=legal_mask(previous_state),
     action=previous_action,
+    action_name=action_name(previous_action),
     reward,
     next_state=state,
+    next_legal_mask=legal_mask(state),
     terminal=false,
    )
   end
@@ -529,9 +639,12 @@ function process_terminal!(
     session_id=previous_state[2],
     sequence,
     state=previous_state,
+    legal_mask=legal_mask(previous_state),
     action=previous_action,
+    action_name=action_name(previous_action),
     reward,
     next_state=nothing,
+    next_legal_mask=nothing,
     terminal=true,
    )
   end
@@ -554,8 +667,9 @@ end
 """Compile the full gradient/update path on a disposable model before accepting training clients."""
 function warmup_training_runtime!()::Nothing
  state = UInt32[
-  1, 0, 0, 1_000, 500, 500, 20, 4, 8, 1,
-  1, 1, 1, 1, 4, 3, 2, 1,
+  2, 0, 0, 1_000, 500, 500, 20, 4, 8, 1, 1, 1, 1, 1, 4, 3,
+  2, 1, 8, 5, 4, 2, 1, 1, 1, 1, 1, 1, 4, 3, 2, 1,
+  UInt32(0x00000003), 0,
  ]
  trainer = create_trainer(
   mode=MODE_TRAIN,

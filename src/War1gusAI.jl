@@ -10,7 +10,7 @@ const DEFAULT_PORT = 48721
 const INIT_PREFIX = UInt8('I')
 const STEP_PREFIX = UInt8('S')
 const END_PREFIX = UInt8('E')
-const PROTOCOL_VERSION = UInt32(1)
+const PROTOCOL_VERSION = UInt32(2)
 const CLIENT_SHUTDOWN_GRACE_SECONDS = 1.0
 
 struct StepFrame
@@ -58,7 +58,7 @@ function decode_step_frame(io::IO, prefix::UInt8)::Union{StepFrame,Nothing}
  for index in eachindex(state)
   state[index] = decode_u32_be(bytes, 9 + 4 * (index - 1))
  end
- state[1] == PROTOCOL_VERSION || throw(ArgumentError("unsupported AI state protocol version $(state[1])"))
+ validate_state(state)
  return StepFrame(
   decode_u32_be(bytes, 1),
   reinterpret(Int32, decode_u32_be(bytes, 5)),
@@ -102,6 +102,7 @@ function handle_client(
      sequence=frame.sequence,
      reward=frame.reward,
      state=frame.state,
+     legal_mask=legal_mask(frame.state),
     )
     action = process_step!(trainer, session, frame.sequence, frame.reward, frame.state)
     write(socket, UInt8(action))
@@ -112,6 +113,8 @@ function handle_client(
      session_id=session_id,
      sequence=frame.sequence,
      action=action,
+     action_name=action_name(action),
+     legal_mask=legal_mask(frame.state),
     )
    else
     log_event(
@@ -121,6 +124,7 @@ function handle_client(
      sequence=frame.sequence,
      reward=frame.reward,
      state=frame.state,
+     legal_mask=legal_mask(frame.state),
     )
     process_terminal!(trainer, session, frame.sequence, frame.reward)
     lock(sessions_lock) do
