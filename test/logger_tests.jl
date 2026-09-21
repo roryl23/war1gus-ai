@@ -199,6 +199,29 @@ end
   end
 end
 
+@testset "event logger reports unavailable file" begin
+  War1gusAI.stop_event_logger!()
+  mktempdir() do directory
+    stdout_buffer = IOBuffer()
+    try
+      War1gusAI.start_event_logger!(path=directory, stdout_io=stdout_buffer)
+      War1gusAI.log_event("survives_file_error")
+      War1gusAI.stop_event_logger!()
+      +
+      lines = filter(!isempty, split(String(take!(stdout_buffer)), '\n'))
+      @test length(lines) == 2
+      @test all(is_json_line, lines)
+      error_line = only(filter(line -> occursin("\"type\":\"logger_error\"", line), lines))
+      @test occursin("\"operation\":\"open\"", error_line)
+      @test occursin("\"path\":\"$(directory)\"", error_line)
+      @test occursin("\"error\":\"", error_line)
+      @test any(line -> occursin("\"type\":\"survives_file_error\"", line), lines)
+    finally
+      War1gusAI.stop_event_logger!()
+    end
+  end
+end
+
 @testset "event logger bounded shutdown" begin
   War1gusAI.stop_event_logger!()
   path = tempname()

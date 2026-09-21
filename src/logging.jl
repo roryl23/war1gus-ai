@@ -149,11 +149,27 @@ function _take_event_batch!(logger::EventLogger)::Union{Vector{String},Nothing}
     unlock(logger.lock)
   end
 end
+function _report_file_error!(logger::EventLogger, operation::AbstractString, error)::Nothing
+  line = _event_line(
+    "logger_error",
+    time(),
+    (operation=operation, path=logger.path, error=sprint(showerror, error)),
+  )
+  try
+    write(logger.stdout_io, line)
+    write(logger.stdout_io, UInt8('\n'))
+    flush(logger.stdout_io)
+  catch
+  end
+  return nothing
+end
+
 
 function _write_event_lines!(logger::EventLogger)::Nothing
   file_io = try
     open(logger.path, "a")
-  catch
+  catch error
+    _report_file_error!(logger, "open", error)
     nothing
   end
   try
@@ -165,7 +181,8 @@ function _write_event_lines!(logger::EventLogger)::Nothing
           try
             write(file_io, line)
             write(file_io, UInt8('\n'))
-          catch
+          catch error
+            _report_file_error!(logger, "write", error)
             try
               close(file_io)
             catch
@@ -182,7 +199,13 @@ function _write_event_lines!(logger::EventLogger)::Nothing
       if !isnothing(file_io)
         try
           flush(file_io)
-        catch
+        catch error
+          _report_file_error!(logger, "flush", error)
+          try
+            close(file_io)
+          catch
+          end
+          file_io = nothing
         end
       end
       try
@@ -194,8 +217,13 @@ function _write_event_lines!(logger::EventLogger)::Nothing
     if !isnothing(file_io)
       try
         flush(file_io)
+      catch error
+        _report_file_error!(logger, "flush", error)
+      end
+      try
         close(file_io)
-      catch
+      catch error
+        _report_file_error!(logger, "close", error)
       end
     end
     try
