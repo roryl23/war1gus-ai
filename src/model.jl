@@ -485,8 +485,20 @@ function process_step!(
    sequence == session.last_sequence + one(UInt32) ||
     throw(ArgumentError("out-of-order AI step sequence $sequence"))
   end
-  if is_training(trainer) && !isnothing(session.previous_state)
-   _enqueue_transition_locked!(trainer, session.previous_state, session.previous_action::Int, reward, state)
+  previous_state = session.previous_state
+  if is_training(trainer) && !isnothing(previous_state)
+   previous_action = session.previous_action::Int
+   _enqueue_transition_locked!(trainer, previous_state, previous_action, reward, state)
+   log_event(
+    "training_sample";
+    session_id=previous_state[2],
+    sequence,
+    state=previous_state,
+    action=previous_action,
+    reward,
+    next_state=state,
+    terminal=false,
+   )
   end
   action = select_action(trainer.policy, state; training=is_training(trainer), rng=trainer.rng)
   session.previous_state = state
@@ -508,8 +520,20 @@ function process_terminal!(
    sequence == session.last_sequence + one(UInt32) ||
     throw(ArgumentError("out-of-order AI terminal sequence $sequence"))
   end
-  if is_training(trainer) && !isnothing(session.previous_state)
-   _enqueue_transition_locked!(trainer, session.previous_state, session.previous_action::Int, reward, nothing)
+  previous_state = session.previous_state
+  if is_training(trainer) && !isnothing(previous_state)
+   previous_action = session.previous_action::Int
+   _enqueue_transition_locked!(trainer, previous_state, previous_action, reward, nothing)
+   log_event(
+    "training_sample";
+    session_id=previous_state[2],
+    sequence,
+    state=previous_state,
+    action=previous_action,
+    reward,
+    next_state=nothing,
+    terminal=true,
+   )
   end
   session.previous_state = nothing
   session.previous_action = nothing

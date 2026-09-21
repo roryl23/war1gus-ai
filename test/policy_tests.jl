@@ -13,6 +13,15 @@ end
 
 model_state_snapshot(policy) = deepcopy(Flux.state(policy))
 
+function json_scalar_field_matches(record::AbstractString, field::AbstractString, value::AbstractString)::Bool
+  return occursin(Regex("\"" * field * "\"\\s*:\\s*" * value * "(?:\\s*[,}])"), record)
+end
+
+function json_array_field_matches(record::AbstractString, field::AbstractString, values)::Bool
+  contents = join(string.(values), "\\s*,\\s*")
+  return occursin(Regex("\"" * field * "\"\\s*:\\s*\\[" * contents * "\\s*\\]"), record)
+end
+
 @testset "state-conditioned transformer policy" begin
   policy = War1gusAI.create_policy()
   early = representative_state(workers=2)
@@ -160,6 +169,77 @@ end
     @test trainer.update_count == 0
     @test isempty(trainer.pending_transitions)
     @test Flux.state(trainer.policy) == before
+  end
+end
+
+@testset "live training transition events" begin
+  mktempdir() do directory
+    path = joinpath(directory, "events.jsonl")
+    trainer = War1gusAI.create_trainer(
+      mode=War1gusAI.MODE_TRAIN,
+      checkpoint_path=joinpath(directory, "events.jls"),
+      seed=43,
+      batch_size=32,
+      checkpoint_every=100,
+    )
+    first = representative_state(gold=510)
+    first[2] = UInt32(71)
+    second = representative_state(gold=720)
+    second[2] = UInt32(72)
+    inference = War1gusAI.create_trainer(
+      mode=War1gusAI.MODE_INFERENCE,
+      checkpoint_path=joinpath(directory, "inference-events.jls"),
+      seed=47,
+    )
+    direct = War1gusAI.create_trainer(
+      mode=War1gusAI.MODE_TRAIN,
+      checkpoint_path=joinpath(directory, "direct-events.jls"),
+      seed=53,
+      batch_size=32,
+      checkpoint_every=100,
+    )
+    first_action = 0
+    second_action = 0
+
+    War1gusAI.start_event_logger!(; path, stdout_io=devnull)
+    try
+      War1gusAI.enqueue_transition!(direct, first, 0, Int32(17), second)
+      session = War1gusAI.ClientSession()
+      first_action = War1gusAI.process_step!(trainer, session, UInt32(7), Int32(0), first)
+      second_action = War1gusAI.process_step!(trainer, session, UInt32(8), Int32(41), second)
+      @test War1gusAI.process_step!(trainer, session, UInt32(8), Int32(999), representative_state(gold=999)) == second_action
+      War1gusAI.process_terminal!(trainer, session, UInt32(9), Int32(-100))
+
+      inference_session = War1gusAI.ClientSession()
+      War1gusAI.process_step!(inference, inference_session, UInt32(0), Int32(0), first)
+      War1gusAI.process_step!(inference, inference_session, UInt32(1), Int32(25), second)
+      War1gusAI.process_terminal!(inference, inference_session, UInt32(2), Int32(-25))
+    finally
+      War1gusAI.stop_event_logger!()
+    end
+
+    records = filter(
+      record -> json_scalar_field_matches(record, "type", "\"training_sample\""),
+      readlines(path),
+    )
+    @test length(records) == 2
+
+    nonterminal, terminal = records
+    @test json_scalar_field_matches(nonterminal, "session_id", "71")
+    @test json_scalar_field_matches(nonterminal, "sequence", "8")
+    @test json_array_field_matches(nonterminal, "state", first)
+    @test json_scalar_field_matches(nonterminal, "action", string(first_action))
+    @test json_scalar_field_matches(nonterminal, "reward", "41")
+    @test json_array_field_matches(nonterminal, "next_state", second)
+    @test json_scalar_field_matches(nonterminal, "terminal", "false")
+
+    @test json_scalar_field_matches(terminal, "session_id", "72")
+    @test json_scalar_field_matches(terminal, "sequence", "9")
+    @test json_array_field_matches(terminal, "state", second)
+    @test json_scalar_field_matches(terminal, "action", string(second_action))
+    @test json_scalar_field_matches(terminal, "reward", "-100")
+    @test json_scalar_field_matches(terminal, "next_state", "null")
+    @test json_scalar_field_matches(terminal, "terminal", "true")
   end
 end
 

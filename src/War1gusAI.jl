@@ -2,6 +2,7 @@ module War1gusAI
 
 using Sockets
 
+include("logging.jl")
 include("model.jl")
 
 const DEFAULT_HOST = "127.0.0.1"
@@ -75,6 +76,12 @@ function handle_client(
   init = read_exact(socket, 3)
   isnothing(init) && return nothing
   validate_init_frame(init)
+  log_event(
+   "network_request";
+   request_kind="init",
+   state_dim=Int(init[2]),
+   action_dim=Int(init[3]),
+  )
 
   while true
    prefix_bytes = read_exact(socket, 1)
@@ -88,10 +95,33 @@ function handle_client(
    end
 
    if prefix == STEP_PREFIX
+    log_event(
+     "network_request";
+     request_kind="step",
+     session_id=session_id,
+     sequence=frame.sequence,
+     reward=frame.reward,
+     state=frame.state,
+    )
     action = process_step!(trainer, session, frame.sequence, frame.reward, frame.state)
     write(socket, UInt8(action))
     flush(socket)
+    log_event(
+     "network_response";
+     request_kind="step",
+     session_id=session_id,
+     sequence=frame.sequence,
+     action=action,
+    )
    else
+    log_event(
+     "network_request";
+     request_kind="end",
+     session_id=session_id,
+     sequence=frame.sequence,
+     reward=frame.reward,
+     state=frame.state,
+    )
     process_terminal!(trainer, session, frame.sequence, frame.reward)
     lock(sessions_lock) do
      get(sessions, session_id, nothing) === session && delete!(sessions, session_id)
@@ -101,6 +131,7 @@ function handle_client(
   end
  catch error
   error isa InterruptException && rethrow()
+  log_event("client_error"; error=sprint(showerror, error))
   return nothing
  finally
   isopen(socket) && close(socket)
@@ -114,7 +145,11 @@ function monitor_lifecycle_input(input::IO, server::Sockets.TCPServer)::Nothing
    readline(input) == "stop" && break
   end
  catch error
-  error isa EOFError || rethrow()
+  if error isa EOFError
+   nothing
+  else
+   log_event("error"; context="lifecycle_input", error=sprint(showerror, error))
+  end
  finally
   isopen(server) && close(server)
  end
@@ -132,6 +167,8 @@ function serve(
 )::Nothing
  1 <= port <= typemax(UInt16) || throw(ArgumentError("port must be between 1 and 65535"))
  server = isnothing(listener) ? listen(getaddrinfo(host), port) : listener
+ actual_port = Int(getsockname(server)[2])
+ log_event("server_start"; host=String(host), port=actual_port)
  active_lock = ReentrantLock()
  active_sockets = Set{TCPSocket}()
  active_tasks = Set{Task}()
@@ -164,18 +201,22 @@ function serve(
   end
  finally
   isopen(server) && close(server)
-  tasks = lock(active_lock) do
-   collect(active_tasks)
-  end
-  timedwait(() -> all(istaskdone, tasks), CLIENT_SHUTDOWN_GRACE_SECONDS)
-  sockets = lock(active_lock) do
-   collect(active_sockets)
-  end
-  foreach(socket -> isopen(socket) && close(socket), sockets)
-  foreach(wait, tasks)
-  if is_training(trainer)
-   flush_transitions!(trainer)
-   save_checkpoint!(trainer)
+  try
+   tasks = lock(active_lock) do
+    collect(active_tasks)
+   end
+   timedwait(() -> all(istaskdone, tasks), CLIENT_SHUTDOWN_GRACE_SECONDS)
+   sockets = lock(active_lock) do
+    collect(active_sockets)
+   end
+   foreach(socket -> isopen(socket) && close(socket), sockets)
+   foreach(wait, tasks)
+   if is_training(trainer)
+    flush_transitions!(trainer)
+    save_checkpoint!(trainer)
+   end
+  finally
+   log_event("server_stop"; host=String(host), port=actual_port)
   end
  end
  return nothing
@@ -227,11 +268,14 @@ function real_main(args::AbstractVector{<:AbstractString}=ARGS)::Nothing
 end
 
 function julia_main()::Cint
+ start_event_logger!()
  try
   real_main()
- catch
-  Base.invokelatest(Base.display_error, Base.catch_stack())
+ catch error
+  log_event("error"; error=sprint(showerror, error))
   return 1
+ finally
+  stop_event_logger!()
  end
  return 0
 end
