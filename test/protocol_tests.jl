@@ -1,252 +1,160 @@
 using Sockets
 
 function append_u32_be!(bytes::Vector{UInt8}, value::UInt32)
- append!(bytes, UInt8[(value>>24)&0xff, (value>>16)&0xff, (value>>8)&0xff, value&0xff])
- return bytes
+  append!(bytes, UInt8[(value>>24)&0xff, (value>>16)&0xff, (value>>8)&0xff, value&0xff])
+  return bytes
 end
 
-function processor_frame(prefix::Char, sequence::UInt32, reward::Int32, state::Vector{UInt32})
- bytes = UInt8[prefix]
- append_u32_be!(bytes, sequence)
- append_u32_be!(bytes, reinterpret(UInt32, reward))
- foreach(value -> append_u32_be!(bytes, value), state)
- return bytes
+function v3_entity(; slot=1, relation=1, role=1, x=20, y=20, hp=60, max_hp=60, gold_cost=400, wood_cost=0)
+  return UInt32[slot, 0x1234+slot, relation, role, x, y, hp, max_hp, gold_cost, wood_cost, 0, 0, 1, 4]
 end
 
-function protocol_state(; player=0, cycle=100, legal_actions=(0,), enemy_units=8, enemy_buildings=5)
- mask = foldl((bits, action) -> bits | (UInt64(1) << action), legal_actions; init=UInt64(0))
- return UInt32[
-  2, player, 0, cycle, 500, 500, 20, 4, 8, 1, 1, 1, 1, 1, 2, 2,
-  1, 1, 14, 5, enemy_units, enemy_buildings, 2, 1, 1, 1, 1, 1, 2, 2, 1, 1,
-  UInt32(mask & UInt64(0xffffffff)), UInt32(mask >> 32),
- ]
+function v3_candidate(; kind=0, actor=0, target=0, auxiliary=0, x=0, y=0, group_size=0, formation=0, cadence=0, distance=0, producers=0, bootstrap=0)
+  return UInt32[kind, actor, target, auxiliary, x, y, group_size, formation, cadence, distance, producers, reinterpret(UInt32, Int32(bootstrap))]
 end
 
-@testset "v2 AI processor binary frames and legal mask" begin
- @test isnothing(War1gusAI.validate_init_frame(UInt8['I', 34, 24]))
- @test_throws ArgumentError War1gusAI.validate_init_frame(UInt8['I', 33, 24])
- @test_throws ArgumentError War1gusAI.validate_init_frame(UInt8['I', 34, 23])
- @test_throws ArgumentError War1gusAI.validate_init_frame(UInt8['S', 34, 24])
- @test_throws ArgumentError War1gusAI.validate_init_frame(UInt8['I', 34])
-
- state = protocol_state(player=2, cycle=0x01020304, legal_actions=(0, 4, 16))
- bytes = processor_frame('S', UInt32(0x01020304), Int32(0x11223344), state)[2:end]
- frame = War1gusAI.decode_step_frame(IOBuffer(bytes), UInt8('S'))
- @test frame.sequence == UInt32(0x01020304)
- @test frame.reward == Int32(0x11223344)
- @test frame.state == state
- @test War1gusAI.legal_mask(frame.state) == UInt64(0x0000000000010011)
- negative = processor_frame('S', UInt32(9), Int32(-100), state)[2:end]
- @test War1gusAI.decode_step_frame(IOBuffer(negative), UInt8('S')).reward == Int32(-100)
- @test War1gusAI.decode_step_frame(IOBuffer(bytes[1:end-1]), UInt8('E')) === nothing
- @test_throws ArgumentError War1gusAI.decode_step_frame(IOBuffer(bytes), UInt8('X'))
- @test_throws ArgumentError War1gusAI.decode_step_frame(
-  IOBuffer(processor_frame('S', UInt32(0), Int32(0), protocol_state(legal_actions=()))[2:end]),
-  UInt8('S'),
- )
- old_state = copy(state)
- old_state[1] = 1
- @test_throws ArgumentError War1gusAI.decode_step_frame(IOBuffer(processor_frame('S', UInt32(0), Int32(0), old_state)[2:end]), UInt8('S'))
+function v3_state(
+  ;
+  player=0,
+  cycle=100,
+  entities=Vector{UInt32}[v3_entity()],
+  candidates=Vector{UInt32}[v3_candidate()],
+  enemy_progress=0,
+  own_loss=0,
+  time_reward=0,
+  terminal_reward=0,
+)
+  entity_records = isempty(entities) ? UInt32[] : reduce(vcat, entities)
+  candidate_records = isempty(candidates) ? UInt32[] : reduce(vcat, candidates)
+  header = UInt32[
+    3, player, 0, cycle, 500, 500, 20, 4, 128, 128, length(entities), length(candidates),
+    1_000, 1_000, 500, 500, 0, 0,
+    reinterpret(UInt32, Int32(enemy_progress)), reinterpret(UInt32, Int32(own_loss)),
+    reinterpret(UInt32, Int32(time_reward)), reinterpret(UInt32, Int32(terminal_reward)),
+  ]
+  return vcat(header, entity_records, candidate_records)
 end
 
-@testset "server training mode arguments" begin
- @test War1gusAI.parse_server_args(["--host", "0.0.0.0", "--port", "49100", "--train"]) ==
-       ("0.0.0.0", 49100, War1gusAI.MODE_TRAIN)
- @test War1gusAI.parse_server_args(["--reset-train"]) ==
-       (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_RESET_TRAIN)
- @test War1gusAI.parse_server_args(String[]) ==
-       (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_INFERENCE)
- @test_throws ArgumentError War1gusAI.parse_server_args(["--train", "--reset-train"])
+function processor_frame(
+  prefix::Char,
+  sequence::UInt32,
+  reward::Int32,
+  state::Vector{UInt32};
+  candidate_count=Int(state[12]),
+)
+  bytes = UInt8[prefix]
+  append_u32_be!(bytes, sequence)
+  append_u32_be!(bytes, reinterpret(UInt32, reward))
+  append_u32_be!(bytes, UInt32(length(state)))
+  append_u32_be!(bytes, UInt32(candidate_count))
+  foreach(value -> append_u32_be!(bytes, value), state)
+  return bytes
 end
 
-@testset "AI processor TCP clients emit masked primitive responses" begin
- mktemp() do log_path, log_io
-  close(log_io)
-  stdout_log = IOBuffer()
-  War1gusAI.start_event_logger!(; path=log_path, stdout_io=stdout_log)
+@testset "v3 variable binary framing" begin
+  @test isnothing(War1gusAI.validate_init_frame(UInt8['I', 3]))
+  @test_throws ArgumentError War1gusAI.validate_init_frame(UInt8['I', 2])
+  @test_throws ArgumentError War1gusAI.validate_init_frame(UInt8['I', 3, 0])
+  @test_throws ArgumentError War1gusAI.validate_init_frame(UInt8['S', 3])
+
+  entities = Vector{UInt32}[v3_entity(slot=1), v3_entity(slot=2, relation=2, role=3, hp=45)]
+  candidates = Vector{UInt32}[v3_candidate(), v3_candidate(kind=6, actor=1, target=2, distance=12, bootstrap=250)]
+  state = v3_state(player=2, cycle=0x01020304, entities=entities, candidates=candidates, enemy_progress=90, own_loss=-20, time_reward=-1)
+  bytes = processor_frame('S', UInt32(0x01020304), Int32(-100), state)[2:end]
+  frame = War1gusAI.decode_step_frame(IOBuffer(bytes), UInt8('S'))
+  @test frame.sequence == UInt32(0x01020304)
+  @test frame.reward == Int32(-100)
+  @test frame.state == state
+  @test frame.candidate_count == 2
+  @test War1gusAI.reward_components(state) == (enemy_progress=90.0f0, own_loss=-20.0f0, time=-1.0f0, terminal_component=0.0f0)
+
+  many_candidates = Vector{UInt32}[v3_candidate()]
+  append!(many_candidates, [v3_candidate(kind=7, actor=1, x=index, bootstrap=index) for index in 1:299])
+  many = v3_state(entities=Vector{UInt32}[v3_entity()], candidates=many_candidates)
+  @test War1gusAI.decode_step_frame(IOBuffer(processor_frame('S', UInt32(1), Int32(0), many)[2:end]), UInt8('S')).candidate_count == 300
+  large_entities = Vector{UInt32}[v3_entity(slot=index) for index in 1:4_100]
+  large_state = v3_state(entities=large_entities, candidates=Vector{UInt32}[v3_candidate()])
+  @test War1gusAI.decode_step_frame(IOBuffer(processor_frame('S', UInt32(2), Int32(0), large_state)[2:end]), UInt8('S')).candidate_count == 1
+
+  terminal = v3_state(entities=entities, candidates=Vector{UInt32}[], terminal_reward=1_000)
+  terminal_frame = War1gusAI.decode_step_frame(IOBuffer(processor_frame('E', UInt32(2), Int32(1_000), terminal)[2:end]), UInt8('E'))
+  @test terminal_frame.candidate_count == 0
+  @test War1gusAI.parse_state(terminal; terminal=true).candidates == War1gusAI.CandidateObservation[]
+
+  @test_throws ArgumentError War1gusAI.decode_step_frame(IOBuffer(processor_frame('S', UInt32(0), Int32(0), state; candidate_count=1)[2:end]), UInt8('S'))
+  @test_throws ArgumentError War1gusAI.decode_step_frame(IOBuffer(processor_frame('S', UInt32(0), Int32(0), terminal)[2:end]), UInt8('S'))
+  @test_throws ArgumentError War1gusAI.decode_step_frame(IOBuffer(processor_frame('E', UInt32(0), Int32(0), state)[2:end]), UInt8('E'))
+  @test War1gusAI.decode_step_frame(IOBuffer(bytes[1:end-1]), UInt8('S')) === nothing
+  @test_throws ArgumentError War1gusAI.decode_step_frame(IOBuffer(bytes), UInt8('X'))
+
+  malformed = copy(state)
+  malformed[1] = 2
+  @test_throws ArgumentError War1gusAI.decode_step_frame(IOBuffer(processor_frame('S', UInt32(0), Int32(0), malformed)[2:end]), UInt8('S'))
+  oversized = copy(state)
+  oversized[12] = UInt32(513)
+  @test_throws ArgumentError War1gusAI.parse_state(oversized)
+end
+
+@testset "v3 server emits a u32 candidate index" begin
   server = listen(ip"127.0.0.1", 0)
   port = Int(getsockname(server)[2])
-  trainer = War1gusAI.create_trainer(checkpoint_path=tempname())
+  trainer = War1gusAI.create_trainer(checkpoint_path=tempname(), seed=7)
   sessions = Dict{UInt32,War1gusAI.ClientSession}()
   sessions_lock = ReentrantLock()
-  handlers = Task[]
-  accepter = @async for _ in 1:3
-   socket = accept(server)
-   push!(handlers, @async War1gusAI.handle_client(socket, trainer, sessions, sessions_lock))
-  end
-  wait_only = protocol_state(player=1, legal_actions=(0,))
-  restricted = protocol_state(player=2, legal_actions=(0, 4, 16))
-  clients = TCPSocket[]
+  completed = Set{UInt32}()
+  handler = @async War1gusAI.handle_client(accept(server), trainer, sessions, sessions_lock, completed)
+  client = connect(ip"127.0.0.1", port)
+  candidates = Vector{UInt32}[v3_candidate()]
+  append!(candidates, [v3_candidate(kind=7, actor=1, x=index, bootstrap=index == 299 ? 1_000_000 : 0) for index in 1:299])
+  state = v3_state(player=5, candidates=candidates)
   try
-   first_client = connect(ip"127.0.0.1", port)
-   second_client = connect(ip"127.0.0.1", port)
-   malformed_client = connect(ip"127.0.0.1", port)
-   append!(clients, [first_client, second_client, malformed_client])
-
-   for (client, state) in ((first_client, wait_only), (second_client, restricted))
-    write(client, UInt8['I', 34, 24])
+    write(client, UInt8['I', 3])
     write(client, processor_frame('S', UInt32(0), Int32(0), state))
     flush(client)
-    action = Int(read(client, UInt8))
-    @test War1gusAI.is_legal_action(state, action)
-    if state === wait_only
-     @test action == War1gusAI.ACTION_WAIT
-    end
+    response = War1gusAI.decode_u32_be(War1gusAI.read_exact(client, 4)::Vector{UInt8}, 1)
+    @test response == UInt32(299)
+    @test response > UInt32(255)
 
-    write(client, processor_frame('S', UInt32(1), Int32(0), state))
+    terminal = v3_state(player=5, candidates=Vector{UInt32}[], terminal_reward=1_000)
+    write(client, processor_frame('E', UInt32(1), Int32(1_000), terminal))
     flush(client)
-    @test Int(read(client, UInt8)) == action
-    write(client, processor_frame('E', UInt32(2), Int32(0), state))
-    flush(client)
-    @test_throws EOFError read(client, UInt8)
-   end
-   write(malformed_client, UInt8['I', 34, 23])
-   flush(malformed_client)
+    wait(handler)
+    @test UInt32(5) in completed
   finally
-   foreach(client -> isopen(client) && close(client), clients)
+    isopen(client) && close(client)
+    isopen(server) && close(server)
   end
-  wait(accepter)
-  foreach(wait, handlers)
-  close(server)
-  War1gusAI.stop_event_logger!()
-
-  log_lines = filter(line -> !isempty(line), split(read(log_path, String), '\n'))
-  stdout_lines = filter(line -> !isempty(line), split(String(take!(stdout_log)), '\n'))
-  event_types = [only(match(r"\"type\":\"([^\"]+)\"", line).captures) for line in log_lines]
-  request_lines = [line for (line, event_type) in zip(log_lines, event_types) if event_type == "network_request"]
-  response_lines = [line for (line, event_type) in zip(log_lines, event_types) if event_type == "network_response"]
-  client_error_lines = [line for (line, event_type) in zip(log_lines, event_types) if event_type == "client_error"]
-  @test log_lines == stdout_lines
-  @test length(request_lines) == 8
-  @test length(response_lines) == 4
-  @test length(client_error_lines) == 1
-  @test any(line -> occursin("\"state_dim\":34", line) && occursin("\"action_dim\":24", line), request_lines)
-  @test all(line -> occursin("\"legal_mask\":", line), filter(line -> occursin("\"request_kind\":\"step\"", line), request_lines))
-  @test all(line -> occursin("\"action_name\":", line) && occursin("\"legal_mask\":", line), response_lines)
- end
 end
 
-@testset "stdin lifecycle shutdown" begin
- stopped = listen(ip"127.0.0.1", 0)
- War1gusAI.monitor_lifecycle_input(IOBuffer("ignored\nstop\n"), stopped)
- @test !isopen(stopped)
- ended = listen(ip"127.0.0.1", 0)
- War1gusAI.monitor_lifecycle_input(IOBuffer("ignored\n"), ended)
- @test !isopen(ended)
-end
-
-@testset "lifecycle shutdown closes active clients" begin
- game_listener = listen(ip"127.0.0.1", 0)
- game_port = Int(getsockname(game_listener)[2])
- control_listener = listen(ip"127.0.0.1", 0)
- control_port = Int(getsockname(control_listener)[2])
- control_writer = connect(ip"127.0.0.1", control_port)
- control_reader = accept(control_listener)
- game_client = connect(ip"127.0.0.1", game_port)
- trainer = War1gusAI.create_trainer(checkpoint_path=tempname())
- server_task = @async War1gusAI.serve("127.0.0.1", game_port; trainer=trainer, listener=game_listener, lifecycle_input=control_reader)
- try
-  write(game_client, UInt8['I', 34, 24])
-  state = protocol_state(legal_actions=(0,))
-  write(game_client, processor_frame('S', UInt32(0), Int32(0), state))
-  flush(game_client)
-  @test Int(read(game_client, UInt8)) == 0
-  write(control_writer, "stop\n")
-  flush(control_writer)
-  wait(server_task)
-  @test_throws EOFError read(game_client, UInt8)
- finally
-  isopen(game_client) && close(game_client)
-  isopen(control_writer) && close(control_writer)
-  isopen(control_reader) && close(control_reader)
-  isopen(control_listener) && close(control_listener)
- end
-end
-
-@testset "reconnect preserves and deduplicates client session" begin
- mktempdir() do directory
-  server = listen(ip"127.0.0.1", 0)
-  port = Int(getsockname(server)[2])
-  trainer = War1gusAI.create_trainer(mode=War1gusAI.MODE_TRAIN, checkpoint_path=joinpath(directory, "reconnect.jls"), batch_size=32)
-  sessions = Dict{UInt32,War1gusAI.ClientSession}()
-  sessions_lock = ReentrantLock()
-  handlers = Task[]
-  accepter = @async for _ in 1:3
-   socket = accept(server)
-   push!(handlers, @async War1gusAI.handle_client(socket, trainer, sessions, sessions_lock))
+@testset "server modes include launcher league environment" begin
+  @test War1gusAI.parse_server_args(["--host", "0.0.0.0", "--port", "49100", "--train"]) ==
+        ("0.0.0.0", 49100, War1gusAI.MODE_TRAIN)
+  @test War1gusAI.parse_server_args(["--league-train"]) ==
+        (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_LEAGUE)
+  @test War1gusAI.parse_server_args(["--league-evaluate"]) ==
+        (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_LEAGUE_EVALUATE)
+  configured = withenv("WAR1GUS_AI_MODE" => "league-train") do
+    War1gusAI.parse_server_args(String[])
   end
-  first_state = protocol_state(player=2, legal_actions=(0, 1, 4))
-  second_state = protocol_state(player=2, cycle=101, legal_actions=(0, 2, 5))
-  clients = TCPSocket[]
-  try
-   first = connect(ip"127.0.0.1", port)
-   push!(clients, first)
-   write(first, UInt8['I', 34, 24])
-   write(first, processor_frame('S', UInt32(0), Int32(0), first_state))
-   flush(first)
-   read(first, UInt8)
-   close(first)
-
-   second = connect(ip"127.0.0.1", port)
-   push!(clients, second)
-   write(second, UInt8['I', 34, 24])
-   write(second, processor_frame('S', UInt32(1), Int32(41), second_state))
-   flush(second)
-   second_action = read(second, UInt8)
-   @test length(trainer.pending_transitions) == 1
-   close(second)
-
-   retry = connect(ip"127.0.0.1", port)
-   push!(clients, retry)
-   write(retry, UInt8['I', 34, 24])
-   write(retry, processor_frame('S', UInt32(1), Int32(41), second_state))
-   flush(retry)
-   @test read(retry, UInt8) == second_action
-   @test length(trainer.pending_transitions) == 1
-   write(retry, processor_frame('E', UInt32(2), Int32(100), second_state))
-   flush(retry)
-   @test_throws EOFError read(retry, UInt8)
-  finally
-   foreach(client -> isopen(client) && close(client), clients)
-   wait(accepter)
-   foreach(wait, handlers)
-   close(server)
+  evaluation = withenv("WAR1GUS_AI_MODE" => "league-evaluate") do
+    War1gusAI.parse_server_args(String[])
   end
-  @test trainer.update_count == 1
-  @test isempty(trainer.pending_transitions)
- end
-end
-
-@testset "lifecycle shutdown drains terminal frame" begin
- mktempdir() do directory
-  game_listener = listen(ip"127.0.0.1", 0)
-  game_port = Int(getsockname(game_listener)[2])
-  control_listener = listen(ip"127.0.0.1", 0)
-  control_port = Int(getsockname(control_listener)[2])
-  control_writer = connect(ip"127.0.0.1", control_port)
-  control_reader = accept(control_listener)
-  game_client = connect(ip"127.0.0.1", game_port)
-  trainer = War1gusAI.create_trainer(mode=War1gusAI.MODE_TRAIN, checkpoint_path=joinpath(directory, "terminal.jls"), batch_size=32)
-  server_task = @async War1gusAI.serve("127.0.0.1", game_port; trainer=trainer, listener=game_listener, lifecycle_input=control_reader)
-  state = protocol_state(player=3, legal_actions=(0, 1, 4))
-  try
-   write(game_client, UInt8['I', 34, 24])
-   write(game_client, processor_frame('S', UInt32(0), Int32(0), state))
-   flush(game_client)
-   read(game_client, UInt8)
-   write(game_client, processor_frame('E', UInt32(1), Int32(100), state))
-   flush(game_client)
-   write(control_writer, "stop\n")
-   flush(control_writer)
-   wait(server_task)
-   @test trainer.update_count == 1
-   @test isempty(trainer.pending_transitions)
-   @test_throws EOFError read(game_client, UInt8)
-  finally
-   isopen(game_client) && close(game_client)
-   isopen(control_writer) && close(control_writer)
-   isopen(control_reader) && close(control_reader)
-   isopen(control_listener) && close(control_listener)
+  command_override = withenv("WAR1GUS_AI_MODE" => "league-train") do
+    War1gusAI.parse_server_args(["--league-evaluate"])
   end
- end
+  restart_override = withenv("WAR1GUS_AI_MODE" => "reset-train") do
+    War1gusAI.parse_server_args(["--train"])
+  end
+  selected_seed = withenv("WAR1GUS_AI_SEED" => "73") do
+    War1gusAI.training_seed_from_environment()
+  end
+  configured_checkpoint = withenv("WAR1GUS_AI_CHECKPOINT" => "/tmp/shared-ppo.jls") do
+    War1gusAI.default_checkpoint_path()
+  end
+  @test selected_seed == 73
+  @test configured == (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_LEAGUE)
+  @test evaluation == (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_LEAGUE_EVALUATE)
+  @test configured_checkpoint == "/tmp/shared-ppo.jls"
+  @test command_override == (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_LEAGUE_EVALUATE)
+  @test restart_override == (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_TRAIN)
 end

@@ -3,258 +3,347 @@ using Random
 using Serialization
 using Statistics
 
-const STATE_DIM = 34
-const FEATURE_DIM = 32
-const ACTION_DIM = 24
+const STATE_VERSION = UInt32(3)
+const STATE_HEADER_WORDS = 22
+const ENTITY_WORDS = 14
+const CANDIDATE_WORDS = 12
+const MAX_CANDIDATES = 512
+const MAX_STATE_WORDS = 65_536
+const MAX_ENTITY_COUNT = div(MAX_STATE_WORDS - STATE_HEADER_WORDS, ENTITY_WORDS)
+const CANDIDATE_KIND_COUNT = 12
 const EMBED_DIM = 48
-const NUM_HEADS = 4
 const HIDDEN_DIM = 96
-const TOKEN_COUNT = 3
-const CATALOG_VERSION = 2
-const REWARD_VERSION = 2
-const LEGAL_MASK_ENCODING = "u32-low-high-words-33-34"
-const VALID_ACTION_MASK = (UInt64(1) << ACTION_DIM) - UInt64(1)
+const CHECKPOINT_VERSION = 4
+const CATALOG_VERSION = 3
+const REWARD_VERSION = 3
+const POLICY_VERSION = 3
+const PPO_VERSION = 1
+const DEFAULT_RANDOM_SEED = 0x574131
+const DEFAULT_BATCH_SIZE = 128
+const DEFAULT_ROLLOUT_FRAGMENT = 32
+const DEFAULT_PPO_EPOCHS = 4
+const DEFAULT_CHECKPOINT_EVERY = 16
+const DEFAULT_LEAGUE_SNAPSHOT_EVERY = 8
+const DEFAULT_LEAGUE_MAX_SNAPSHOTS = 8
+const PPO_ALGORITHM = "trajectory-ppo-gae-v1"
 
-const ACTION_WAIT = 0
-const ACTION_GATHER_GOLD = 1
-const ACTION_GATHER_WOOD = 2
-const ACTION_BUILD_TOWN_HALL = 3
-const ACTION_TRAIN_WORKER = 4
-const ACTION_BUILD_FARM = 5
-const ACTION_BUILD_BARRACKS = 6
-const ACTION_BUILD_LUMBER_MILL = 7
-const ACTION_BUILD_BLACKSMITH = 8
-const ACTION_BUILD_STABLES = 9
-const ACTION_TRAIN_SOLDIER = 10
-const ACTION_TRAIN_SHOOTER = 11
-const ACTION_TRAIN_CAVALRY = 12
-const ACTION_TRAIN_CATAPULT = 13
-const ACTION_RESEARCH_WEAPON = 14
-const ACTION_RESEARCH_ARMOR = 15
-const ACTION_ATTACK_NEAREST_UNIT = 16
-const ACTION_ATTACK_NEAREST_BUILDING = 17
-const ACTION_ATTACK_WEAKEST_UNIT = 18
-const ACTION_ATTACK_WEAKEST_BUILDING = 19
-const ACTION_DEFEND_BASE = 20
-const ACTION_EXPLORE = 21
-const ACTION_PREPARE_BUILDING_SPACE = 22
-const ACTION_REPAIR_BUILDING = 23
 
-const ACTION_NAMES = (
- "wait",
- "gather-gold",
- "gather-wood",
- "build-town-hall",
- "train-worker",
- "build-farm",
- "build-barracks",
- "build-lumber-mill",
- "build-blacksmith",
- "build-stables",
- "train-soldier",
- "train-shooter",
- "train-cavalry",
- "train-catapult",
- "research-weapon",
- "research-armor",
- "attack-nearest-unit",
- "attack-nearest-building",
- "attack-weakest-unit",
- "attack-weakest-building",
- "defend-base",
- "explore",
- "prepare-building-space",
- "repair-building",
-)
-
+function training_seed_from_environment()::Int
+ raw = get(ENV, "WAR1GUS_AI_SEED", "")
+ isempty(raw) && return DEFAULT_RANDOM_SEED
+ seed = tryparse(Int, raw)
+ !isnothing(seed) || throw(ArgumentError("WAR1GUS_AI_SEED must be an integer"))
+ return seed
+end
 const MODE_INFERENCE = :inference
 const MODE_TRAIN = :train
 const MODE_RESET_TRAIN = :reset_train
-const CHECKPOINT_VERSION = 3
-const DEFAULT_BATCH_SIZE = 32
-const DEFAULT_CHECKPOINT_EVERY = 32
+const MODE_LEAGUE = :league
+const MODE_LEAGUE_EVALUATE = :league_evaluate
 
-"""Return the stable name for a zero-based primitive action ID."""
-function action_name(action::Integer)::String
- 0 <= action < ACTION_DIM || throw(ArgumentError("action $action is outside the AI action range"))
- return ACTION_NAMES[Int(action)+1]
+const CANDIDATE_NAMES = (
+ "wait",
+ "gather-gold",
+ "gather-wood",
+ "build",
+ "train",
+ "research",
+ "attack-entity",
+ "move-group",
+ "explore",
+ "repair",
+ "formation",
+ "defend",
+)
+
+"""Return the stable name for a v3 candidate kind."""
+function candidate_name(kind::Integer)::String
+ 0 <= kind < CANDIDATE_KIND_COUNT || throw(ArgumentError("candidate kind $kind is outside the v3 catalog"))
+ return CANDIDATE_NAMES[Int(kind)+1]
 end
 
-"""State encoder, self-attention block, policy head, and scalar value head."""
+struct EntityObservation
+ words::NTuple{ENTITY_WORDS,UInt32}
+end
+
+struct CandidateObservation
+ words::NTuple{CANDIDATE_WORDS,UInt32}
+end
+
+struct StateObservation
+ header::NTuple{STATE_HEADER_WORDS,UInt32}
+ entities::Vector{EntityObservation}
+ candidates::Vector{CandidateObservation}
+end
+
+@inline player_of(state::AbstractVector{<:Integer}) = UInt32(state[2])
+@inline state_entity_count(state::AbstractVector{<:Integer}) = Int(UInt32(state[11]))
+@inline state_candidate_count(state::AbstractVector{<:Integer}) = Int(UInt32(state[12]))
+@inline candidate_kind(candidate::CandidateObservation) = Int(candidate.words[1])
+@inline candidate_actor(candidate::CandidateObservation) = Int(candidate.words[2])
+@inline candidate_target(candidate::CandidateObservation) = Int(candidate.words[3])
+@inline candidate_bootstrap_score(candidate::CandidateObservation) = _signed_word(candidate.words[12]) / 1_000.0f0
+
+@inline function _signed_word(word::UInt32)::Float32
+ return word <= UInt32(typemax(Int32)) ? Float32(word) :
+        Float32(Int64(word) - 4_294_967_296)
+end
+
+"""Return separately logged shaping components carried in a v3 state header."""
+function reward_components(state::AbstractVector{<:Integer})
+ length(state) >= STATE_HEADER_WORDS || throw(ArgumentError("AI state has $(length(state)) words, shorter than its v3 header"))
+ return (
+  enemy_progress=_signed_word(UInt32(state[19])),
+  own_loss=_signed_word(UInt32(state[20])),
+  time=_signed_word(UInt32(state[21])),
+  terminal_component=_signed_word(UInt32(state[22])),
+ )
+end
+
+"""Validate a complete variable-length v3 state and its authoritative candidate catalog."""
+function validate_state(
+ state::AbstractVector{<:Integer};
+ terminal::Bool=false,
+ frame_candidate_count::Union{Nothing,Integer}=nothing,
+)::Nothing
+ length(state) >= STATE_HEADER_WORDS ||
+  throw(ArgumentError("AI state has $(length(state)) words, shorter than its v3 header"))
+ UInt32(state[1]) == STATE_VERSION ||
+  throw(ArgumentError("unsupported AI state protocol version $(state[1])"))
+
+ entity_count = state_entity_count(state)
+ candidate_count = state_candidate_count(state)
+ entity_count <= MAX_ENTITY_COUNT ||
+  throw(ArgumentError("AI state has $entity_count entities, exceeding the defensive cap of $MAX_ENTITY_COUNT"))
+ candidate_count <= MAX_CANDIDATES ||
+  throw(ArgumentError("AI state has $candidate_count candidates, exceeding the defensive cap of $MAX_CANDIDATES"))
+ if terminal
+  candidate_count == 0 || throw(ArgumentError("AI terminal state must not contain candidates"))
+ else
+  candidate_count >= 1 || throw(ArgumentError("AI step state must contain at least the wait candidate"))
+ end
+ if !isnothing(frame_candidate_count)
+  Int(frame_candidate_count) == candidate_count ||
+   throw(ArgumentError("AI frame candidate count $(frame_candidate_count) disagrees with state candidate count $candidate_count"))
+ end
+
+ expected_words = STATE_HEADER_WORDS + ENTITY_WORDS * entity_count + CANDIDATE_WORDS * candidate_count
+ expected_words <= MAX_STATE_WORDS ||
+  throw(ArgumentError("AI state has $expected_words words, exceeding the protocol cap of $MAX_STATE_WORDS"))
+ length(state) == expected_words ||
+  throw(ArgumentError("AI state has $(length(state)) words, expected $expected_words from its v3 counts"))
+
+ candidate_count == 0 && return nothing
+ first_candidate = STATE_HEADER_WORDS + ENTITY_WORDS * entity_count + 1
+ UInt32(state[first_candidate]) == 0 ||
+  throw(ArgumentError("AI candidate 1 must be the wait candidate"))
+ for candidate_index in 1:candidate_count
+  offset = first_candidate + (candidate_index - 1) * CANDIDATE_WORDS
+  kind = Int(UInt32(state[offset]))
+  0 <= kind < CANDIDATE_KIND_COUNT ||
+   throw(ArgumentError("AI candidate $candidate_index has unknown kind $kind"))
+  for field in (2, 3)
+   entity_index = Int(UInt32(state[offset+field-1]))
+   0 <= entity_index <= entity_count ||
+    throw(ArgumentError("AI candidate $candidate_index references entity $entity_index outside 0:$entity_count"))
+  end
+ end
+ return nothing
+end
+
+"""Parse an already validated v3 state into header, entity, and candidate records."""
+function parse_state(state::AbstractVector{<:Integer}; terminal::Bool=false)::StateObservation
+ validate_state(state; terminal)
+ words = UInt32.(state)
+ header = ntuple(index -> words[index], STATE_HEADER_WORDS)
+ entity_count = Int(header[11])
+ candidate_count = Int(header[12])
+ entities = Vector{EntityObservation}(undef, entity_count)
+ offset = STATE_HEADER_WORDS + 1
+ for index in eachindex(entities)
+  entities[index] = EntityObservation(ntuple(field -> words[offset+field-1], ENTITY_WORDS))
+  offset += ENTITY_WORDS
+ end
+ candidates = Vector{CandidateObservation}(undef, candidate_count)
+ for index in eachindex(candidates)
+  candidates[index] = CandidateObservation(ntuple(field -> words[offset+field-1], CANDIDATE_WORDS))
+  offset += CANDIDATE_WORDS
+ end
+ return StateObservation(header, entities, candidates)
+end
+
+"""Variable candidate-scoring policy with entity-aware context and a scalar value head."""
 struct AiPolicy
- state_encoder
- token_encoder
- attention
- feed_forward
- action_head
+ header_encoder
+ entity_encoder
+ candidate_encoder
+ score_head
  value_head
 end
 
 Flux.@layer AiPolicy
 
-function create_policy(; seed::Integer=0x574131)
+function create_policy(; seed::Integer=DEFAULT_RANDOM_SEED)
  rng = MersenneTwister(seed)
  init = (dimensions...) -> Flux.glorot_uniform(rng, dimensions...)
  return AiPolicy(
-  Dense(FEATURE_DIM => EMBED_DIM, tanh; init),
-  Dense(EMBED_DIM => TOKEN_COUNT * EMBED_DIM, tanh; init),
-  Flux.MultiHeadAttention(EMBED_DIM; nheads=NUM_HEADS, dropout_prob=0.0f0, init),
-  Chain(Dense(EMBED_DIM => HIDDEN_DIM, relu; init), Dense(HIDDEN_DIM => EMBED_DIM; init)),
-  Dense(EMBED_DIM => ACTION_DIM; init),
-  Dense(EMBED_DIM => 1; init),
+  Dense(STATE_HEADER_WORDS => EMBED_DIM, tanh; init),
+  Dense(ENTITY_WORDS => EMBED_DIM, tanh; init),
+  Dense(CANDIDATE_WORDS => EMBED_DIM, tanh; init),
+  Chain(Dense(4 * EMBED_DIM => HIDDEN_DIM, tanh; init), Dense(HIDDEN_DIM => 1; init)),
+  Chain(Dense(2 * EMBED_DIM => HIDDEN_DIM, tanh; init), Dense(HIDDEN_DIM => 1; init)),
  )
 end
 
-"""Validate a complete v2 producer state including its nonempty legal-action mask."""
-function validate_state(state::AbstractVector{<:Integer})::Nothing
- length(state) == STATE_DIM || throw(ArgumentError("AI state has $(length(state)) fields, expected $STATE_DIM"))
- UInt32(state[1]) == UInt32(2) || throw(ArgumentError("unsupported AI state protocol version $(state[1])"))
- mask = legal_mask(state)
- mask != 0 || throw(ArgumentError("AI state has no legal actions"))
- (mask & ~VALID_ACTION_MASK) == 0 || throw(ArgumentError("AI state has action bits outside the catalog"))
- (mask & UInt64(1)) != 0 || throw(ArgumentError("AI state must allow wait"))
- return nothing
-end
+@inline _bounded(value::Real, scale::Real) = clamp(Float32(value) / Float32(scale), -4.0f0, 4.0f0)
+@inline _hashed_feature(word::UInt32) = Float32(word % UInt32(65_537)) / 65_537.0f0
 
-"""Decode the producer's low/high UInt32 legality words into a zero-based action mask."""
-function legal_mask(state::AbstractVector{<:Integer})::UInt64
- length(state) == STATE_DIM || throw(ArgumentError("AI state has $(length(state)) fields, expected $STATE_DIM"))
- return UInt64(UInt32(state[33])) | (UInt64(UInt32(state[34])) << 32)
-end
-
-@inline function is_legal_action(state::AbstractVector{<:Integer}, action::Integer)::Bool
- return 0 <= action < ACTION_DIM && (legal_mask(state) & (UInt64(1) << action)) != 0
-end
-
-"""Map the 32 model features, excluding producer-owned legality words, to bounded inputs."""
-function encode_state(state::AbstractVector{<:Integer})::Vector{Float32}
- validate_state(state)
- values = Float32.(state[1:FEATURE_DIM])
- scales = Float32[
-  2, 7, 1, 20_000, 2_000, 2_000, 100, 100, 50, 10, 10, 10, 10, 10, 50, 50,
-  50, 50, 100, 100, 50, 50, 50, 10, 10, 10, 10, 10, 50, 50, 50, 50,
+function encode_header(header::NTuple{STATE_HEADER_WORDS,UInt32})::Vector{Float32}
+ return Float32[
+  _bounded(header[1], 3), _bounded(header[2], 8), _bounded(header[3], 8), _bounded(header[4], 300),
+  _bounded(header[5], 20_000), _bounded(header[6], 20_000), _bounded(header[7], 200), _bounded(header[8], 200),
+  _bounded(header[9], 256), _bounded(header[10], 256), _bounded(header[11], 256), _bounded(header[12], MAX_CANDIDATES),
+  _bounded(header[13], 50_000), _bounded(header[14], 50_000), _bounded(header[15], 50_000), _bounded(header[16], 50_000),
+  _bounded(header[17], 1_000), _bounded(header[18], 1_000), _bounded(_signed_word(header[19]), 1_000),
+  _bounded(_signed_word(header[20]), 1_000), _bounded(_signed_word(header[21]), 100), _bounded(_signed_word(header[22]), 1_000),
  ]
- return clamp.(values ./ scales, 0.0f0, 4.0f0)
 end
 
-function policy_features(policy::AiPolicy, state::AbstractVector{<:Integer})
- encoded = policy.state_encoder(encode_state(state))
- tokens = reshape(policy.token_encoder(encoded), EMBED_DIM, TOKEN_COUNT, 1)
- attended = policy.attention(tokens)[1]
- transformed = tokens .+ attended
- transformed = transformed .+ policy.feed_forward(transformed)
- return vec(mean(transformed; dims=(2, 3)))
+function encode_entity(entity::EntityObservation)::Vector{Float32}
+ words = entity.words
+ return Float32[
+  _bounded(words[1], MAX_ENTITY_COUNT), _hashed_feature(words[2]), _bounded(words[3], 4), _bounded(words[4], 16),
+  _bounded(words[5], 256), _bounded(words[6], 256), _bounded(words[7], 1_000), _bounded(words[8], 1_000),
+  _bounded(words[9], 20_000), _bounded(words[10], 20_000), _hashed_feature(words[11]), _bounded(words[12], 8),
+  _bounded(words[13], 32), _bounded(words[14], 32),
+ ]
 end
 
-function action_logits(policy::AiPolicy, state::AbstractVector{<:Integer})::Vector{Float32}
- validate_state(state)
- return Float32.(policy.action_head(policy_features(policy, state)))
+function encode_candidate(candidate::CandidateObservation)::Vector{Float32}
+ words = candidate.words
+ return Float32[
+  _bounded(words[1], CANDIDATE_KIND_COUNT), _bounded(words[2], MAX_ENTITY_COUNT), _bounded(words[3], MAX_ENTITY_COUNT),
+  _hashed_feature(words[4]), _bounded(words[5], 256), _bounded(words[6], 256), _bounded(words[7], 128),
+  _bounded(words[8], 32), _bounded(words[9], 300), _bounded(words[10], 512), _bounded(words[11], 32),
+  _bounded(_signed_word(words[12]), 1_000),
+ ]
 end
 
-function value_estimate(policy::AiPolicy, state::AbstractVector{<:Integer})::Float32
- return Float32(only(policy.value_head(policy_features(policy, state))))
+function _entity_embeddings(policy::AiPolicy, observation::StateObservation)
+ return map(entity -> policy.entity_encoder(encode_entity(entity)), observation.entities)
 end
 
-@inline state_count(state::AbstractVector{<:Integer}, index::Integer) = Int(state[index])
-
-"""Small low-level bootstrap preferences; legality always remains producer-owned."""
-function action_bootstrap_biases(state::AbstractVector{<:Integer})::NTuple{ACTION_DIM,Float32}
- validate_state(state)
- gold = state_count(state, 5)
- wood = state_count(state, 6)
- supply = state_count(state, 7)
- demand = state_count(state, 8)
- workers = state_count(state, 9)
- town_halls = state_count(state, 10)
- barracks = state_count(state, 11)
- lumber_mills = state_count(state, 12)
- blacksmiths = state_count(state, 13)
- stables = state_count(state, 14)
- combatants = sum(state_count(state, index) for index in 15:18)
- enemy_units = state_count(state, 21)
- enemy_buildings = state_count(state, 22)
-
- return ntuple(ACTION_DIM) do index
-  action = index - 1
-  action == ACTION_GATHER_GOLD && workers > 0 ? (gold < wood ? 0.9f0 : 0.7f0) :
-  action == ACTION_GATHER_WOOD && workers > 0 ? (wood < gold ? 0.9f0 : 0.7f0) :
-  action == ACTION_BUILD_TOWN_HALL && town_halls == 0 ? 3.0f0 :
-  action == ACTION_TRAIN_WORKER && workers < 5 ? 2.0f0 :
-  action == ACTION_BUILD_FARM && demand + 2 >= supply ? 2.5f0 :
-  action == ACTION_BUILD_BARRACKS && barracks == 0 ? 1.8f0 :
-  action == ACTION_BUILD_LUMBER_MILL && lumber_mills == 0 ? 1.7f0 :
-  action == ACTION_BUILD_BLACKSMITH && blacksmiths == 0 ? 1.6f0 :
-  action == ACTION_BUILD_STABLES && stables == 0 ? 1.5f0 :
-  action == ACTION_TRAIN_SOLDIER && barracks > 0 && combatants < 8 ? 1.0f0 :
-  action == ACTION_TRAIN_SHOOTER && lumber_mills > 0 && combatants < 8 ? 0.9f0 :
-  action == ACTION_TRAIN_CAVALRY && stables > 0 ? 0.8f0 :
-  action == ACTION_TRAIN_CATAPULT && blacksmiths > 0 ? 0.8f0 :
-  action == ACTION_PREPARE_BUILDING_SPACE &&
-   (barracks == 0 || lumber_mills == 0 || blacksmiths == 0 || stables == 0) ? 2.2f0 :
-  action == ACTION_ATTACK_NEAREST_UNIT && combatants > 0 && enemy_units > 0 ? 1.4f0 :
-  action == ACTION_ATTACK_NEAREST_BUILDING && combatants > 0 && enemy_buildings > 0 ? 1.3f0 :
-  0.0f0
- end
+function _global_context(policy::AiPolicy, observation::StateObservation)
+ header_embedding = policy.header_encoder(encode_header(observation.header))
+ entity_embeddings = _entity_embeddings(policy, observation)
+ isempty(entity_embeddings) && return header_embedding, entity_embeddings
+ return header_embedding .+ reduce(+, entity_embeddings) ./ Float32(length(entity_embeddings)), entity_embeddings
 end
 
-"""Mask scores with producer authority. Masked actions are never selectable."""
-function mask_action_scores(scores::AbstractVector{<:AbstractFloat}, state::AbstractVector{<:Integer})::Vector{Float32}
- length(scores) == ACTION_DIM || throw(ArgumentError("AI action scores have $(length(scores)) entries, expected $ACTION_DIM"))
- validate_state(state)
- legality = ntuple(index -> is_legal_action(state, index - 1), ACTION_DIM)
- return Float32.(ifelse.(legality, scores, -Inf32))
+function _entity_embedding_or_zero(entity_embeddings, index::Integer)
+ return index == 0 ? zeros(Float32, EMBED_DIM) : entity_embeddings[index]
 end
 
-function action_scores(policy::AiPolicy, state::AbstractVector{<:Integer})::Vector{Float32}
- return mask_action_scores(action_logits(policy, state) .+ action_bootstrap_biases(state), state)
+function _candidate_score(
+ policy::AiPolicy,
+ candidate::CandidateObservation,
+ global_context,
+ entity_embeddings,
+)
+ candidate_embedding = policy.candidate_encoder(encode_candidate(candidate))
+ actor_embedding = _entity_embedding_or_zero(entity_embeddings, candidate_actor(candidate))
+ target_embedding = _entity_embedding_or_zero(entity_embeddings, candidate_target(candidate))
+ return only(policy.score_head(vcat(global_context, candidate_embedding, actor_embedding, target_embedding))) +
+        candidate_bootstrap_score(candidate)
 end
 
-function legal_action_distribution(policy::AiPolicy, state::AbstractVector{<:Integer})
- scores = action_scores(policy, state)
- legal = findall(isfinite, scores)
- isempty(legal) && throw(ArgumentError("AI state has no legal actions"))
- return legal, Flux.softmax(scores[legal])
+"""Score exactly the producer-supplied candidate sequence; no fixed action mask is used."""
+function candidate_scores(policy::AiPolicy, observation::StateObservation)
+ isempty(observation.candidates) && throw(ArgumentError("terminal states have no selectable candidates"))
+ global_context, entity_embeddings = _global_context(policy, observation)
+ return map(candidate -> _candidate_score(policy, candidate, global_context, entity_embeddings), observation.candidates)
 end
 
-function sample_legal_action(scores::AbstractVector{<:AbstractFloat}, rng::AbstractRNG)::Int
- legal = findall(isfinite, scores)
- isempty(legal) && throw(ArgumentError("AI state has no legal actions"))
- probabilities = Flux.softmax(scores[legal])
+function candidate_scores(policy::AiPolicy, state::AbstractVector{<:Integer})
+ return candidate_scores(policy, parse_state(state))
+end
+
+function value_estimate(policy::AiPolicy, observation::StateObservation)
+ global_context, entity_embeddings = _global_context(policy, observation)
+ entity_context = isempty(entity_embeddings) ? zeros(Float32, EMBED_DIM) :
+                  reduce(+, entity_embeddings) ./ Float32(length(entity_embeddings))
+ return only(policy.value_head(vcat(global_context, entity_context)))
+end
+
+function value_estimate(policy::AiPolicy, state::AbstractVector{<:Integer})
+ return value_estimate(policy, parse_state(state))
+end
+
+function candidate_distribution(policy::AiPolicy, observation::StateObservation)
+ scores = candidate_scores(policy, observation)
+ return scores, exp.(Flux.logsoftmax(scores))
+end
+
+function candidate_log_probability_and_entropy(
+ policy::AiPolicy,
+ observation::StateObservation,
+ action::Integer,
+)
+ 0 <= action < length(observation.candidates) ||
+  throw(ArgumentError("candidate index $action is outside the supplied candidate sequence"))
+ scores = candidate_scores(policy, observation)
+ log_probabilities = Flux.logsoftmax(scores)
+ return log_probabilities[Int(action)+1], -sum(exp.(log_probabilities) .* log_probabilities)
+end
+
+function sample_candidate(scores::AbstractVector{<:Real}, rng::AbstractRNG)::Int
+ isempty(scores) && throw(ArgumentError("cannot sample an empty candidate sequence"))
+ probabilities = exp.(Flux.logsoftmax(scores))
  threshold = rand(rng)
  cumulative = zero(eltype(probabilities))
- for (offset, probability) in enumerate(probabilities)
+ for (index, probability) in enumerate(probabilities)
   cumulative += probability
-  threshold <= cumulative && return legal[offset] - 1
+  threshold <= cumulative && return index - 1
  end
- return legal[end] - 1
+ return length(scores) - 1
 end
 
-"""Choose greedily for inference, or sample only producer-legal actions during training."""
+"""Choose greedily for inference and stochastically from supplied candidates during training."""
 function select_action(
  policy::AiPolicy,
- state::AbstractVector{<:Integer};
+ observation::StateObservation;
  training::Bool=false,
  rng::AbstractRNG=Random.default_rng(),
 )::Int
- scores = action_scores(policy, state)
- return training ? sample_legal_action(scores, rng) : argmax(scores) - 1
+ scores = candidate_scores(policy, observation)
+ return training ? sample_candidate(scores, rng) : argmax(scores) - 1
+end
+
+function select_action(policy::AiPolicy, state::AbstractVector{<:Integer}; kwargs...)::Int
+ return select_action(policy, parse_state(state); kwargs...)
 end
 
 function default_checkpoint_path()::String
+ configured = strip(get(ENV, "WAR1GUS_AI_CHECKPOINT", ""))
+ !isempty(configured) && return configured
  state_home = get(ENV, "XDG_STATE_HOME", "")
  root = isempty(state_home) ? joinpath(homedir(), ".local", "state") : state_home
- return joinpath(root, "war1gus", "actor_critic.jls")
+ return joinpath(root, "war1gus", "trajectory_ppo.jls")
 end
 
 function checkpoint_payload(policy::AiPolicy, optimizer_state, update_count::Integer)
  return (
   version=CHECKPOINT_VERSION,
-  state_dim=STATE_DIM,
-  feature_dim=FEATURE_DIM,
-  action_dim=ACTION_DIM,
+  protocol_version=Int(STATE_VERSION),
+  header_words=STATE_HEADER_WORDS,
+  entity_words=ENTITY_WORDS,
+  candidate_words=CANDIDATE_WORDS,
+  max_candidates=MAX_CANDIDATES,
   catalog_version=CATALOG_VERSION,
   reward_version=REWARD_VERSION,
-  mask_encoding=LEGAL_MASK_ENCODING,
+  policy_version=POLICY_VERSION,
+  ppo_version=PPO_VERSION,
+  algorithm=PPO_ALGORITHM,
   update_count=Int(update_count),
   model_state=Flux.state(policy),
   optimizer_state=optimizer_state,
@@ -284,42 +373,37 @@ function save_policy_checkpoint!(
  return nothing
 end
 
-function load_policy_checkpoint!(path::AbstractString, policy::AiPolicy, fresh_optimizer_state)
- isfile(path) || return (update_count=0, optimizer_state=fresh_optimizer_state)
- payload = open(deserialize, path)
+function _validate_checkpoint_payload(payload, fresh_optimizer_state)::Nothing
  payload isa NamedTuple || throw(ArgumentError("AI checkpoint has an invalid format"))
  required = (
-  :version,
-  :state_dim,
-  :feature_dim,
-  :action_dim,
-  :catalog_version,
-  :reward_version,
-  :mask_encoding,
-  :update_count,
-  :model_state,
-  :optimizer_state,
+  :version, :protocol_version, :header_words, :entity_words, :candidate_words, :max_candidates,
+  :catalog_version, :reward_version, :policy_version, :ppo_version, :algorithm, :update_count,
+  :model_state, :optimizer_state,
  )
  all(field -> hasproperty(payload, field), required) ||
-  throw(ArgumentError("AI checkpoint is missing v3 compatibility metadata"))
- payload.version == CHECKPOINT_VERSION ||
-  throw(ArgumentError("AI checkpoint version $(payload.version) is unsupported"))
- Int(payload.state_dim) == STATE_DIM ||
-  throw(ArgumentError("AI checkpoint state dimension $(payload.state_dim) does not match $STATE_DIM"))
- Int(payload.feature_dim) == FEATURE_DIM ||
-  throw(ArgumentError("AI checkpoint feature dimension $(payload.feature_dim) does not match $FEATURE_DIM"))
- Int(payload.action_dim) == ACTION_DIM ||
-  throw(ArgumentError("AI checkpoint action dimension $(payload.action_dim) does not match $ACTION_DIM"))
- Int(payload.catalog_version) == CATALOG_VERSION ||
-  throw(ArgumentError("AI checkpoint catalog version $(payload.catalog_version) is unsupported"))
- Int(payload.reward_version) == REWARD_VERSION ||
-  throw(ArgumentError("AI checkpoint reward version $(payload.reward_version) is unsupported"))
- payload.mask_encoding == LEGAL_MASK_ENCODING ||
-  throw(ArgumentError("AI checkpoint mask encoding $(repr(payload.mask_encoding)) is unsupported"))
+  throw(ArgumentError("AI checkpoint is missing v4 PPO compatibility metadata"))
+ payload.version == CHECKPOINT_VERSION || throw(ArgumentError("AI checkpoint version $(payload.version) is unsupported"))
+ Int(payload.protocol_version) == Int(STATE_VERSION) || throw(ArgumentError("AI checkpoint protocol is incompatible"))
+ Int(payload.header_words) == STATE_HEADER_WORDS || throw(ArgumentError("AI checkpoint header shape is incompatible"))
+ Int(payload.entity_words) == ENTITY_WORDS || throw(ArgumentError("AI checkpoint entity shape is incompatible"))
+ Int(payload.candidate_words) == CANDIDATE_WORDS || throw(ArgumentError("AI checkpoint candidate shape is incompatible"))
+ Int(payload.max_candidates) == MAX_CANDIDATES || throw(ArgumentError("AI checkpoint candidate cap is incompatible"))
+ Int(payload.catalog_version) == CATALOG_VERSION || throw(ArgumentError("AI checkpoint catalog version is incompatible"))
+ Int(payload.reward_version) == REWARD_VERSION || throw(ArgumentError("AI checkpoint reward version is incompatible"))
+ Int(payload.policy_version) == POLICY_VERSION || throw(ArgumentError("AI checkpoint policy version is incompatible"))
+ Int(payload.ppo_version) == PPO_VERSION || throw(ArgumentError("AI checkpoint PPO version is incompatible"))
+ payload.algorithm == PPO_ALGORITHM || throw(ArgumentError("AI checkpoint algorithm is incompatible"))
  payload.update_count isa Integer && payload.update_count >= 0 ||
   throw(ArgumentError("AI checkpoint has an invalid update count"))
  typeof(payload.optimizer_state) == typeof(fresh_optimizer_state) ||
   throw(ArgumentError("AI checkpoint optimizer state is incompatible"))
+ return nothing
+end
+
+function load_policy_checkpoint!(path::AbstractString, policy::AiPolicy, fresh_optimizer_state)
+ isfile(path) || return (update_count=0, optimizer_state=fresh_optimizer_state)
+ payload = open(deserialize, path)
+ _validate_checkpoint_payload(payload, fresh_optimizer_state)
  try
   Flux.loadmodel!(policy, payload.model_state)
  catch error
@@ -328,255 +412,426 @@ function load_policy_checkpoint!(path::AbstractString, policy::AiPolicy, fresh_o
  return (update_count=Int(payload.update_count), optimizer_state=payload.optimizer_state)
 end
 
-function reset_policy_checkpoint!(path::AbstractString)::Nothing
+function reset_policy_checkpoint!(
+ path::AbstractString;
+ league_path::AbstractString=joinpath(dirname(path), "league"),
+)::Nothing
  ispath(path) && rm(path; force=true)
+ isdir(league_path) && rm(league_path; recursive=true, force=true)
  return nothing
 end
 
-struct Transition
- state::Vector{UInt32}
+struct TrajectoryStep
+ observation::StateObservation
  action::Int
- legal_mask::UInt64
- reward::Int32
- next_state::Union{Nothing,Vector{UInt32}}
- next_legal_mask::Union{Nothing,UInt64}
+ reward::Float32
+ old_log_probability::Float32
+ old_value::Float32
+ terminal::Bool
 end
 
-function Transition(
- state::Vector{UInt32},
- action::Integer,
- reward::Int32,
- next_state::Union{Nothing,Vector{UInt32}},
-)
- validate_state(state)
- 0 <= action < ACTION_DIM || throw(ArgumentError("action $action is outside the AI action range"))
- is_legal_action(state, action) || throw(ArgumentError("action $action is not legal for this AI state"))
- !isnothing(next_state) && validate_state(next_state)
- return Transition(
-  state,
-  Int(action),
-  legal_mask(state),
-  reward,
-  next_state,
-  isnothing(next_state) ? nothing : legal_mask(next_state),
- )
+struct TrajectoryFragment
+ steps::Vector{TrajectoryStep}
+ bootstrap_value::Float32
+ terminal::Bool
 end
+
+struct Decision
+ state::Vector{UInt32}
+ observation::StateObservation
+ action::Int
+ log_probability::Float32
+ value::Float32
+end
+
+mutable struct ClientSession
+ previous::Union{Nothing,Decision}
+ fragment::Vector{TrajectoryStep}
+ last_sequence::Union{Nothing,UInt32}
+ player::Union{Nothing,UInt32}
+ trainable::Bool
+ frozen_policy::Union{Nothing,AiPolicy}
+ finalized::Bool
+end
+
+ClientSession() = ClientSession(nothing, TrajectoryStep[], nothing, nothing, true, nothing, false)
 
 mutable struct OnlineTrainer{O,R<:AbstractRNG}
  policy::AiPolicy
  optimizer_state::O
  lock::ReentrantLock
  mode::Symbol
+ read_only::Bool
  gamma::Float32
+ gae_lambda::Float32
+ clip_epsilon::Float32
+ value_coefficient::Float32
  entropy_coefficient::Float32
  update_count::Int
  checkpoint_path::String
  batch_size::Int
+ rollout_fragment::Int
+ ppo_epochs::Int
  checkpoint_every::Int
- pending_transitions::Vector{Transition}
+ pending_fragments::Vector{TrajectoryFragment}
  rng::R
+ train_player::UInt32
+ league_snapshot_every::Int
+ league_max_snapshots::Int
+ league_path::String
+ league_snapshot_override::Union{Nothing,String}
+ league_snapshots::Vector{String}
 end
 
-is_training(trainer::OnlineTrainer)::Bool = trainer.mode == MODE_TRAIN || trainer.mode == MODE_RESET_TRAIN
+is_training(trainer::OnlineTrainer)::Bool =
+ !trainer.read_only && trainer.mode in (MODE_TRAIN, MODE_RESET_TRAIN, MODE_LEAGUE)
+is_league(trainer::OnlineTrainer)::Bool =
+ trainer.mode in (MODE_LEAGUE, MODE_LEAGUE_EVALUATE)
+is_league_evaluation(trainer::OnlineTrainer)::Bool =
+ trainer.mode == MODE_LEAGUE_EVALUATE
+
+function _train_player_from_environment()::UInt32
+ raw = get(ENV, "WAR1GUS_AI_TRAIN_PLAYER", "0")
+ parsed = tryparse(Int, raw)
+ !isnothing(parsed) && 0 <= parsed <= typemax(UInt32) ||
+  throw(ArgumentError("WAR1GUS_AI_TRAIN_PLAYER must be a nonnegative UInt32 player index"))
+ return UInt32(parsed)
+end
+
+function read_only_from_environment()::Bool
+ value = lowercase(strip(get(ENV, "WAR1GUS_AI_READ_ONLY", "")))
+ value in ("", "0", "false", "no", "off") && return false
+ value in ("1", "true", "yes", "on") && return true
+ throw(ArgumentError("WAR1GUS_AI_READ_ONLY must be a boolean value"))
+end
+
+function league_directory_from_environment(checkpoint_path::AbstractString)::String
+ configured = strip(get(ENV, "WAR1GUS_AI_LEAGUE_DIR", ""))
+ return isempty(configured) ? joinpath(dirname(checkpoint_path), "league") : configured
+end
+
+function league_snapshot_from_environment()::Union{Nothing,String}
+ configured = strip(get(ENV, "WAR1GUS_AI_SNAPSHOT", ""))
+ return isempty(configured) ? nothing : configured
+end
+
+league_directory(trainer::OnlineTrainer) = trainer.league_path
+
+function _refresh_league_snapshots!(trainer::OnlineTrainer)::Nothing
+ directory = league_directory(trainer)
+ if !isdir(directory)
+  trainer.league_snapshots = String[]
+  return nothing
+ end
+ trainer.league_snapshots = sort(
+  [joinpath(directory, name) for name in readdir(directory) if startswith(name, "snapshot-") && endswith(name, ".jls") && isfile(joinpath(directory, name))],
+ )
+ return nothing
+end
+
+function _save_league_snapshot_locked!(trainer::OnlineTrainer)::String
+ is_training(trainer) || throw(ArgumentError("read-only or evaluation trainers cannot save league snapshots"))
+ directory = league_directory(trainer)
+ mkpath(directory)
+ path = joinpath(directory, "snapshot-$(lpad(trainer.update_count, 10, '0')).jls")
+ save_policy_checkpoint!(path, trainer.policy, trainer.optimizer_state, trainer.update_count)
+ _refresh_league_snapshots!(trainer)
+ overflow = length(trainer.league_snapshots) - trainer.league_max_snapshots
+ protected = trainer.league_snapshot_override
+ removable = isnothing(protected) ? trainer.league_snapshots :
+             filter(snapshot -> snapshot != protected, trainer.league_snapshots)
+ for stale in removable[1:min(max(overflow, 0), length(removable))]
+  rm(stale; force=true)
+ end
+ _refresh_league_snapshots!(trainer)
+ log_event("league_snapshot"; update_count=trainer.update_count, path, retained=length(trainer.league_snapshots))
+ return path
+end
+
+function _load_frozen_policy(trainer::OnlineTrainer, path::AbstractString)::AiPolicy
+ isfile(path) || throw(ArgumentError("frozen league snapshot does not exist: $path"))
+ frozen = create_policy(seed=0xF00D)
+ optimizer = Flux.OptimiserChain(Flux.ClipNorm(1.0f0), Flux.Adam(1.0f-3))
+ fresh_optimizer_state = Flux.setup(optimizer, frozen)
+ load_policy_checkpoint!(path, frozen, fresh_optimizer_state)
+ return frozen
+end
+
+function _frozen_snapshot_path_locked!(trainer::OnlineTrainer)::String
+ !isnothing(trainer.league_snapshot_override) && return trainer.league_snapshot_override::String
+ if isempty(trainer.league_snapshots)
+  is_training(trainer) ||
+   throw(ArgumentError("league evaluation requires WAR1GUS_AI_SNAPSHOT or an existing league snapshot"))
+  return _save_league_snapshot_locked!(trainer)
+ end
+ return rand(trainer.rng, trainer.league_snapshots)
+end
+
+function _assign_session_locked!(trainer::OnlineTrainer, session::ClientSession, player::UInt32)::Nothing
+ if isnothing(session.player)
+  session.player = player
+  session.trainable = !is_league(trainer) || player == trainer.train_player
+  if is_league(trainer) && !session.trainable
+   path = _frozen_snapshot_path_locked!(trainer)
+   session.frozen_policy = _load_frozen_policy(trainer, path)
+   log_event("league_assignment"; player=Int(player), train_player=Int(trainer.train_player), trainable=false, snapshot=path)
+  elseif is_league(trainer)
+   log_event("league_assignment"; player=Int(player), train_player=Int(trainer.train_player), trainable=true, snapshot=nothing)
+  end
+ elseif session.player != player
+  throw(ArgumentError("AI session player changed from $(session.player) to $player"))
+ end
+ return nothing
+end
 
 function create_trainer(
  ;
  mode::Symbol=MODE_INFERENCE,
  checkpoint_path::AbstractString=default_checkpoint_path(),
- seed::Integer=0x574131,
- gamma::Real=0.99f0,
+ seed::Integer=training_seed_from_environment(),
+ gamma::Real=0.9995f0,
+ gae_lambda::Real=0.95f0,
+ clip_epsilon::Real=0.2f0,
+ value_coefficient::Real=0.5f0,
  entropy_coefficient::Real=0.01f0,
  batch_size::Integer=DEFAULT_BATCH_SIZE,
+ rollout_fragment::Integer=DEFAULT_ROLLOUT_FRAGMENT,
+ ppo_epochs::Integer=DEFAULT_PPO_EPOCHS,
  checkpoint_every::Integer=DEFAULT_CHECKPOINT_EVERY,
+ train_player::UInt32=_train_player_from_environment(),
+ league_snapshot_every::Integer=DEFAULT_LEAGUE_SNAPSHOT_EVERY,
+ league_max_snapshots::Integer=DEFAULT_LEAGUE_MAX_SNAPSHOTS,
+ read_only::Bool=read_only_from_environment(),
+ league_path::AbstractString=league_directory_from_environment(checkpoint_path),
+ league_snapshot_override::Union{Nothing,AbstractString}=league_snapshot_from_environment(),
  policy::Union{Nothing,AiPolicy}=nothing,
 )
- mode in (MODE_INFERENCE, MODE_TRAIN, MODE_RESET_TRAIN) || throw(ArgumentError("unknown AI mode: $mode"))
- batch_size > 0 || throw(ArgumentError("batch size must be positive"))
+ mode in (MODE_INFERENCE, MODE_TRAIN, MODE_RESET_TRAIN, MODE_LEAGUE, MODE_LEAGUE_EVALUATE) ||
+  throw(ArgumentError("unknown AI mode: $mode"))
+ batch_size > 0 || throw(ArgumentError("PPO batch size must be positive"))
+ rollout_fragment > 0 || throw(ArgumentError("PPO rollout fragment length must be positive"))
+ ppo_epochs > 0 || throw(ArgumentError("PPO epoch count must be positive"))
  checkpoint_every > 0 || throw(ArgumentError("checkpoint interval must be positive"))
- 0.0 <= gamma <= 1.0 || throw(ArgumentError("discount factor must be in [0, 1]"))
+ league_snapshot_every > 0 || throw(ArgumentError("league snapshot interval must be positive"))
+ league_max_snapshots > 0 || throw(ArgumentError("league snapshot bound must be positive"))
+ 0.0 <= gamma <= 1.0 || throw(ArgumentError("GAE discount factor must be in [0, 1]"))
+ 0.0 <= gae_lambda <= 1.0 || throw(ArgumentError("GAE lambda must be in [0, 1]"))
+ 0.0 < clip_epsilon < 1.0 || throw(ArgumentError("PPO clipping epsilon must be in (0, 1)"))
+ value_coefficient >= 0 || throw(ArgumentError("value coefficient must not be negative"))
  entropy_coefficient >= 0 || throw(ArgumentError("entropy coefficient must not be negative"))
 
  selected_policy = isnothing(policy) ? create_policy(seed=seed) : policy
  selected_path = String(checkpoint_path)
+ selected_league_path = abspath(String(league_path))
+ selected_override = isnothing(league_snapshot_override) ? nothing : abspath(String(league_snapshot_override))
  optimizer = Flux.OptimiserChain(Flux.ClipNorm(1.0f0), Flux.Adam(1.0f-3))
  fresh_optimizer_state = Flux.setup(optimizer, selected_policy)
- restored = if mode == MODE_RESET_TRAIN
-  reset_policy_checkpoint!(selected_path)
+ restored = if mode == MODE_RESET_TRAIN && !read_only
+  reset_policy_checkpoint!(selected_path; league_path=selected_league_path)
   (update_count=0, optimizer_state=fresh_optimizer_state)
  else
   load_policy_checkpoint!(selected_path, selected_policy, fresh_optimizer_state)
  end
- return OnlineTrainer(
-  selected_policy,
-  restored.optimizer_state,
-  ReentrantLock(),
-  mode,
-  Float32(gamma),
-  Float32(entropy_coefficient),
-  restored.update_count,
-  selected_path,
-  Int(batch_size),
-  Int(checkpoint_every),
-  Transition[],
-  MersenneTwister(seed),
+ trainer = OnlineTrainer(
+  selected_policy, restored.optimizer_state, ReentrantLock(), mode, read_only, Float32(gamma), Float32(gae_lambda),
+  Float32(clip_epsilon), Float32(value_coefficient), Float32(entropy_coefficient), restored.update_count,
+  selected_path, Int(batch_size), Int(rollout_fragment), Int(ppo_epochs), Int(checkpoint_every),
+  TrajectoryFragment[], MersenneTwister(seed), train_player, Int(league_snapshot_every),
+  Int(league_max_snapshots), selected_league_path, selected_override, String[],
  )
+ if is_league(trainer)
+  !isnothing(selected_override) && !isfile(selected_override) &&
+   throw(ArgumentError("WAR1GUS_AI_SNAPSHOT does not name a file: $selected_override"))
+  _refresh_league_snapshots!(trainer)
+  !isnothing(selected_override) && _load_frozen_policy(trainer, selected_override)
+  if isempty(trainer.league_snapshots) && isnothing(selected_override)
+   is_training(trainer) ? _save_league_snapshot_locked!(trainer) :
+   throw(ArgumentError("league evaluation requires WAR1GUS_AI_SNAPSHOT or an existing league snapshot"))
+  end
+  log_event(
+   "league_configuration";
+   mode=String(mode),
+   train_player=Int(train_player),
+   directory=selected_league_path,
+   snapshot_override=selected_override,
+   read_only,
+  )
+ end
+ log_event("trainer_seed"; seed=Int(seed), mode=String(mode), train_player=Int(train_player), read_only)
+ return trainer
 end
 
 function save_checkpoint!(trainer::OnlineTrainer)::Nothing
+ is_training(trainer) || return nothing
  lock(trainer.lock) do
-  save_policy_checkpoint!(
-   trainer.checkpoint_path,
-   trainer.policy,
-   trainer.optimizer_state,
-   trainer.update_count,
-  )
+  save_policy_checkpoint!(trainer.checkpoint_path, trainer.policy, trainer.optimizer_state, trainer.update_count)
  end
  return nothing
 end
 
-function action_log_probability_and_entropy(policy::AiPolicy, state::AbstractVector{<:Integer}, action::Integer)
- legal, probabilities = legal_action_distribution(policy, state)
- position = findfirst(==(Int(action) + 1), legal)
- isnothing(position) && throw(ArgumentError("action $action is not legal for this AI state"))
- return log(probabilities[position]), -sum(probabilities .* log.(probabilities))
-end
-
-function _batch_targets_and_advantages(trainer::OnlineTrainer, transitions::Vector{Transition})
- targets = Vector{Float32}(undef, length(transitions))
- advantages = Vector{Float32}(undef, length(transitions))
- for index in eachindex(transitions)
-  transition = transitions[index]
-  value = value_estimate(trainer.policy, transition.state)
-  bootstrap = isnothing(transition.next_state) ? 0.0f0 : value_estimate(trainer.policy, transition.next_state)
-  target = Float32(transition.reward) +
-           (isnothing(transition.next_state) ? 0.0f0 : trainer.gamma * bootstrap)
-  targets[index] = target
-  advantages[index] = target - value
+function _fragment_gae(trainer::OnlineTrainer, fragment::TrajectoryFragment)
+ count = length(fragment.steps)
+ advantages = Vector{Float32}(undef, count)
+ targets = Vector{Float32}(undef, count)
+ advantage = 0.0f0
+ for index in count:-1:1
+  step = fragment.steps[index]
+  next_value = index == count ? fragment.bootstrap_value : fragment.steps[index+1].old_value
+  continuation = step.terminal ? 0.0f0 : 1.0f0
+  delta = step.reward + trainer.gamma * continuation * next_value - step.old_value
+  advantage = delta + trainer.gamma * trainer.gae_lambda * continuation * advantage
+  advantages[index] = advantage
+  targets[index] = step.old_value + advantage
  end
  return targets, advantages
 end
 
-function _batch_actor_critic_loss(
+"""Compute GAE targets for complete terminal or bootstrapped trajectory fragments."""
+function trajectory_targets_and_advantages(trainer::OnlineTrainer, fragments::Vector{TrajectoryFragment})
+ steps = TrajectoryStep[]
+ targets = Float32[]
+ advantages = Float32[]
+ for fragment in fragments
+  isempty(fragment.steps) && continue
+  fragment_targets, fragment_advantages = _fragment_gae(trainer, fragment)
+  append!(steps, fragment.steps)
+  append!(targets, fragment_targets)
+  append!(advantages, fragment_advantages)
+ end
+ isempty(steps) && return steps, targets, advantages
+ scale = std(advantages; corrected=false)
+ normalized = scale > eps(Float32) ? (advantages .- mean(advantages)) ./ scale : advantages .- mean(advantages)
+ return steps, targets, Float32.(normalized)
+end
+
+function _ppo_loss(
  policy::AiPolicy,
- transitions::Vector{Transition},
+ steps::Vector{TrajectoryStep},
  targets::Vector{Float32},
  advantages::Vector{Float32},
+ clip_epsilon::Float32,
+ value_coefficient::Float32,
  entropy_coefficient::Float32,
 )
  total_loss = 0.0f0
- for index in eachindex(transitions)
-  transition = transitions[index]
-  value = value_estimate(policy, transition.state)
-  log_probability, entropy = action_log_probability_and_entropy(policy, transition.state, transition.action)
-  actor_loss = -advantages[index] * log_probability
-  critic_loss = 0.5f0 * (value - targets[index])^2
-  total_loss += actor_loss + critic_loss - entropy_coefficient * entropy
+ for index in eachindex(steps)
+  step = steps[index]
+  log_probability, entropy = candidate_log_probability_and_entropy(policy, step.observation, step.action)
+  ratio = exp(log_probability - step.old_log_probability)
+  unclipped_policy = ratio * advantages[index]
+  clipped_policy = clamp(ratio, 1.0f0 - clip_epsilon, 1.0f0 + clip_epsilon) * advantages[index]
+  actor_loss = -min(unclipped_policy, clipped_policy)
+  value = value_estimate(policy, step.observation)
+  unclipped_value_loss = (value - targets[index])^2
+  clipped_value = step.old_value + clamp(value - step.old_value, -clip_epsilon, clip_epsilon)
+  clipped_value_loss = (clipped_value - targets[index])^2
+  critic_loss = 0.5f0 * max(unclipped_value_loss, clipped_value_loss)
+  total_loss += actor_loss + value_coefficient * critic_loss - entropy_coefficient * entropy
  end
- return total_loss / Float32(length(transitions))
+ return total_loss / Float32(length(steps))
 end
 
-"""Drain queued transitions in arrival order and perform exactly one shared update."""
+function _pending_step_count(trainer::OnlineTrainer)::Int
+ return sum(length(fragment.steps) for fragment in trainer.pending_fragments)
+end
+
 function _drain_pending_locked!(trainer::OnlineTrainer)::Union{Nothing,Float32}
- isempty(trainer.pending_transitions) && return nothing
- transitions = trainer.pending_transitions
- targets, advantages = _batch_targets_and_advantages(trainer, transitions)
- result = Flux.withgradient(trainer.policy) do policy
-  _batch_actor_critic_loss(policy, transitions, targets, advantages, trainer.entropy_coefficient)
+ is_training(trainer) || return nothing
+ isempty(trainer.pending_fragments) && return nothing
+ fragments = trainer.pending_fragments
+ steps, targets, advantages = trajectory_targets_and_advantages(trainer, fragments)
+ isempty(steps) && return nothing
+ loss = 0.0f0
+ for _ in 1:trainer.ppo_epochs
+  result = Flux.withgradient(trainer.policy) do policy
+   _ppo_loss(
+    policy, steps, targets, advantages, trainer.clip_epsilon,
+    trainer.value_coefficient, trainer.entropy_coefficient,
+   )
+  end
+  loss = Float32(result.val)
+  isfinite(loss) || throw(ArgumentError("PPO update produced a non-finite loss"))
+  Flux.update!(trainer.optimizer_state, trainer.policy, result.grad[1])
  end
- loss = Float32(result.val)
- isfinite(loss) || throw(ArgumentError("actor-critic update produced a non-finite loss"))
- Flux.update!(trainer.optimizer_state, trainer.policy, result.grad[1])
- trainer.pending_transitions = Transition[]
+ trainer.pending_fragments = TrajectoryFragment[]
  trainer.update_count += 1
+ log_event(
+  "ppo_update";
+  update_count=trainer.update_count,
+  fragments=length(fragments),
+  steps=length(steps),
+  epochs=trainer.ppo_epochs,
+  loss,
+  gamma=trainer.gamma,
+  gae_lambda=trainer.gae_lambda,
+  clip_epsilon=trainer.clip_epsilon,
+ )
  trainer.update_count % trainer.checkpoint_every == 0 &&
-  save_policy_checkpoint!(
-   trainer.checkpoint_path,
-   trainer.policy,
-   trainer.optimizer_state,
-   trainer.update_count,
-  )
+  save_policy_checkpoint!(trainer.checkpoint_path, trainer.policy, trainer.optimizer_state, trainer.update_count)
+ is_league(trainer) && trainer.update_count % trainer.league_snapshot_every == 0 &&
+  _save_league_snapshot_locked!(trainer)
  return loss
 end
 
-function _enqueue_transition_locked!(
+function _submit_fragment_locked!(
  trainer::OnlineTrainer,
- state::Vector{UInt32},
- action::Integer,
+ session::ClientSession,
+ bootstrap_value::Float32,
+ terminal::Bool,
+)::Union{Nothing,Float32}
+ isempty(session.fragment) && return nothing
+ push!(trainer.pending_fragments, TrajectoryFragment(copy(session.fragment), bootstrap_value, terminal))
+ empty!(session.fragment)
+ return _pending_step_count(trainer) >= trainer.batch_size ? _drain_pending_locked!(trainer) : nothing
+end
+
+function _log_training_step(
+ decision::Decision,
  reward::Int32,
+ sequence::UInt32,
  next_state::Union{Nothing,Vector{UInt32}},
-)::Union{Nothing,Float32}
- is_training(trainer) || return nothing
- 0 <= action < ACTION_DIM || throw(ArgumentError("action $action is outside the AI action range"))
- push!(trainer.pending_transitions, Transition(state, Int(action), reward, next_state))
- return length(trainer.pending_transitions) >= trainer.batch_size ? _drain_pending_locked!(trainer) : nothing
+ terminal::Bool,
+)::Nothing
+ log_event(
+  "training_sample";
+  session_id=Int(player_of(decision.state)),
+  sequence,
+  state=decision.state,
+  action=decision.action,
+  candidate_kind=candidate_name(candidate_kind(decision.observation.candidates[decision.action+1])),
+  reward,
+  next_state,
+  terminal,
+ )
+ return nothing
 end
 
-"""Queue a non-terminal TD transition; a full queue performs one batch update."""
-function enqueue_transition!(
- trainer::OnlineTrainer,
- state::Vector{UInt32},
- action::Integer,
+function _log_reward_decomposition(
+ state::AbstractVector{<:Integer},
+ sequence::UInt32,
  reward::Int32,
- next_state::Vector{UInt32},
-)::Union{Nothing,Float32}
- lock(trainer.lock) do
-  return _enqueue_transition_locked!(trainer, state, action, reward, next_state)
- end
+ terminal::Bool,
+)::Nothing
+ components = reward_components(state)
+ log_event(
+  "reward_decomposition";
+  session_id=Int(player_of(state)),
+  sequence,
+  reward,
+  enemy_progress=components.enemy_progress,
+  own_loss=components.own_loss,
+  time=components.time,
+  terminal_component=components.terminal_component,
+  terminal,
+ )
+ return nothing
 end
 
-function enqueue_transition!(
- trainer::OnlineTrainer,
- state::Vector{UInt32},
- action::Integer,
- reward::Integer,
- next_state::Vector{UInt32},
-)::Union{Nothing,Float32}
- typemin(Int32) <= reward <= typemax(Int32) || throw(ArgumentError("reward is outside Int32 range"))
- return enqueue_transition!(trainer, state, action, Int32(reward), next_state)
+function _training_session(trainer::OnlineTrainer, session::ClientSession)::Bool
+ return is_training(trainer) && session.trainable
 end
 
-update_transition!(args...) = enqueue_transition!(args...)
-
-"""Flush all queued transitions. Terminal frames use this after adding their own transition."""
-function flush_transitions!(trainer::OnlineTrainer)::Union{Nothing,Float32}
- lock(trainer.lock) do
-  return is_training(trainer) ? _drain_pending_locked!(trainer) : nothing
- end
-end
-
-"""Queue a terminal transition and flush its non-empty partial batch without bootstrap."""
-function update_terminal!(
- trainer::OnlineTrainer,
- state::Vector{UInt32},
- action::Integer,
- reward::Int32,
-)::Union{Nothing,Float32}
- lock(trainer.lock) do
-  is_training(trainer) || return nothing
-  _enqueue_transition_locked!(trainer, state, action, reward, nothing)
-  return _drain_pending_locked!(trainer)
- end
-end
-
-function update_terminal!(
- trainer::OnlineTrainer,
- state::Vector{UInt32},
- action::Integer,
- reward::Integer,
-)::Union{Nothing,Float32}
- typemin(Int32) <= reward <= typemax(Int32) || throw(ArgumentError("reward is outside Int32 range"))
- return update_terminal!(trainer, state, action, Int32(reward))
-end
-
-mutable struct ClientSession
- previous_state::Union{Nothing,Vector{UInt32}}
- previous_action::Union{Nothing,Int}
- last_sequence::Union{Nothing,UInt32}
-end
-
-ClientSession() = ClientSession(nothing, nothing, nothing)
-
-"""Credit the previous client action, then select and record the current action."""
+"""Credit the prior decision, append a trajectory step, then select the current candidate."""
 function process_step!(
  trainer::OnlineTrainer,
  session::ClientSession,
@@ -584,107 +839,111 @@ function process_step!(
  reward::Int32,
  state::Vector{UInt32},
 )::Int
+ observation = parse_state(state)
  lock(trainer.lock) do
+  session.finalized && throw(ArgumentError("AI session for player $(session.player) is already finalized"))
+  _assign_session_locked!(trainer, session, player_of(state))
   if !isnothing(session.last_sequence)
    if sequence == session.last_sequence
-    return session.previous_action::Int
+    return (session.previous::Decision).action
    end
    sequence == session.last_sequence + one(UInt32) ||
     throw(ArgumentError("out-of-order AI step sequence $sequence"))
   end
-  previous_state = session.previous_state
-  if is_training(trainer) && !isnothing(previous_state)
-   previous_action = session.previous_action::Int
-   _enqueue_transition_locked!(trainer, previous_state, previous_action, reward, state)
-   log_event(
-    "training_sample";
-    session_id=previous_state[2],
-    sequence,
-    state=previous_state,
-    legal_mask=legal_mask(previous_state),
-    action=previous_action,
-    action_name=action_name(previous_action),
-    reward,
-    next_state=state,
-    next_legal_mask=legal_mask(state),
-    terminal=false,
-   )
+
+  previous = session.previous
+  if !isnothing(previous)
+   if _training_session(trainer, session)
+    push!(session.fragment, TrajectoryStep(previous.observation, previous.action, Float32(reward), previous.log_probability, previous.value, false))
+    if length(session.fragment) >= trainer.rollout_fragment
+     _submit_fragment_locked!(trainer, session, Float32(value_estimate(trainer.policy, observation)), false)
+    end
+    _log_training_step(previous, reward, sequence, state, false)
+   end
+   _log_reward_decomposition(state, sequence, reward, false)
   end
-  action = select_action(trainer.policy, state; training=is_training(trainer), rng=trainer.rng)
-  session.previous_state = state
-  session.previous_action = action
+
+  active_policy = session.trainable ? trainer.policy : (session.frozen_policy::AiPolicy)
+  training = _training_session(trainer, session)
+  action = select_action(active_policy, observation; training, rng=trainer.rng)
+  log_probability, _ = candidate_log_probability_and_entropy(active_policy, observation, action)
+  value = value_estimate(active_policy, observation)
+  session.previous = Decision(state, observation, action, Float32(log_probability), Float32(value))
   session.last_sequence = sequence
   return action
  end
 end
 
-"""Credit the final client action, flush a partial batch, and persist training."""
+"""Attach terminal reward to the last live candidate, submit its fragment, and finalize once."""
 function process_terminal!(
  trainer::OnlineTrainer,
  session::ClientSession,
  sequence::UInt32,
  reward::Int32,
-)::Nothing
+ state::Vector{UInt32},
+)::Bool
+ parse_state(state; terminal=true)
  lock(trainer.lock) do
+  session.finalized && return false
+  _assign_session_locked!(trainer, session, player_of(state))
   if !isnothing(session.last_sequence)
    sequence == session.last_sequence + one(UInt32) ||
     throw(ArgumentError("out-of-order AI terminal sequence $sequence"))
   end
-  previous_state = session.previous_state
-  if is_training(trainer) && !isnothing(previous_state)
-   previous_action = session.previous_action::Int
-   _enqueue_transition_locked!(trainer, previous_state, previous_action, reward, nothing)
-   log_event(
-    "training_sample";
-    session_id=previous_state[2],
-    sequence,
-    state=previous_state,
-    legal_mask=legal_mask(previous_state),
-    action=previous_action,
-    action_name=action_name(previous_action),
-    reward,
-    next_state=nothing,
-    next_legal_mask=nothing,
-    terminal=true,
-   )
+  previous = session.previous
+  if !isnothing(previous) && _training_session(trainer, session)
+   push!(session.fragment, TrajectoryStep(previous.observation, previous.action, Float32(reward), previous.log_probability, previous.value, true))
+   _submit_fragment_locked!(trainer, session, 0.0f0, true)
+   _log_training_step(previous, reward, sequence, nothing, true)
   end
-  session.previous_state = nothing
-  session.previous_action = nothing
+  _log_reward_decomposition(state, sequence, reward, true)
+  session.previous = nothing
   session.last_sequence = nothing
+  session.finalized = true
   if is_training(trainer)
    _drain_pending_locked!(trainer)
-   save_policy_checkpoint!(
-    trainer.checkpoint_path,
-    trainer.policy,
-    trainer.optimizer_state,
-    trainer.update_count,
-   )
+   save_policy_checkpoint!(trainer.checkpoint_path, trainer.policy, trainer.optimizer_state, trainer.update_count)
   end
+  log_event("episode_finalized"; player=Int(player_of(state)), sequence, reward, trained=_training_session(trainer, session))
+  return true
  end
- return nothing
 end
 
-"""Compile the full gradient/update path on a disposable model before accepting training clients."""
-function warmup_training_runtime!()::Nothing
- state = UInt32[
-  2, 0, 0, 1_000, 500, 500, 20, 4, 8, 1, 1, 1, 1, 1, 4, 3,
-  2, 1, 8, 5, 4, 2, 1, 1, 1, 1, 1, 1, 4, 3, 2, 1,
-  UInt32(0x00000003), 0,
+"""Flush queued trajectory fragments, preserving GAE bootstraps already captured at boundaries."""
+function flush_trajectories!(trainer::OnlineTrainer)::Union{Nothing,Float32}
+ lock(trainer.lock) do
+  return is_training(trainer) ? _drain_pending_locked!(trainer) : nothing
+ end
+end
+
+function _warmup_state(; terminal::Bool=false)::Vector{UInt32}
+ header = UInt32[
+  STATE_VERSION, 0, 0, 300, 500, 500, 20, 4, 128, 128, 1, terminal ? 0 : 2,
+  1_000, 1_000, 500, 500, 0, 0, 0, 0, 0, 0,
  ]
+ entity = UInt32[1, 0x1234, 1, 1, 20, 20, 60, 60, 400, 0, 0, 0, 1, 4]
+ wait = UInt32[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+ gather = UInt32[1, 1, 0, 0, 20, 20, 1, 0, 5, 10, 1, 100]
+ return terminal ? vcat(header, entity) : vcat(header, entity, wait, gather)
+end
+
+"""Compile the trajectory PPO gradient path on a disposable trainer before accepting training clients."""
+function warmup_training_runtime!()::Nothing
  trainer = create_trainer(
   mode=MODE_TRAIN,
   checkpoint_path=tempname(),
-  batch_size=DEFAULT_BATCH_SIZE,
+  batch_size=2,
+  rollout_fragment=2,
+  ppo_epochs=1,
   checkpoint_every=typemax(Int),
  )
- action = select_action(trainer.policy, state)
- for _ in 1:DEFAULT_BATCH_SIZE
-  enqueue_transition!(trainer, state, action, Int32(1), state)
- end
+ state = _warmup_state()
+ session = ClientSession()
+ process_step!(trainer, session, UInt32(0), Int32(0), state)
+ process_step!(trainer, session, UInt32(1), Int32(1), state)
+ process_terminal!(trainer, session, UInt32(2), Int32(1), _warmup_state(terminal=true))
  return nothing
 end
 
-
-const DEFAULT_POLICY = create_policy()
-
+const DEFAULT_POLICY = create_policy(seed=DEFAULT_RANDOM_SEED)
 select_action(state::AbstractVector{<:Integer}) = select_action(DEFAULT_POLICY, state)
