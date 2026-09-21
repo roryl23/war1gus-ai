@@ -1,6 +1,7 @@
 const EVENT_LOGGER_LOCK = ReentrantLock()
 const EVENT_LOGGER_LIFECYCLE_LOCK = ReentrantLock()
 const EVENT_LOGGER = Ref{Any}(nothing)
+const EVENT_LOGGER_SHUTDOWN_TIMEOUT_SECONDS = 1.0
 
 mutable struct EventLogger
   lock::ReentrantLock
@@ -13,8 +14,11 @@ mutable struct EventLogger
   task::Union{Nothing,Task}
 end
 
-"""Return the default JSON-lines log beside the compiled executable."""
-default_log_path()::String = joinpath(Sys.BINDIR, "War1gusAI.log")
+"""Return the JSON-lines log path, honoring an explicit environment override."""
+function default_log_path()::String
+  path = get(ENV, "WAR1GUS_AI_LOG_PATH", "")
+  return isempty(path) ? joinpath(Sys.BINDIR, "War1gusAI.log") : path
+end
 
 @inline function _json_hex_digit(value::UInt32)::UInt8
   return value < 10 ? UInt8('0') + UInt8(value) : UInt8('a') + UInt8(value - 10)
@@ -211,7 +215,8 @@ function _stop_event_logger!(logger::EventLogger)::Nothing
   finally
     unlock(logger.lock)
   end
-  !isnothing(logger.task) && wait(logger.task)
+  task = logger.task
+  !isnothing(task) && timedwait(() -> istaskdone(task), EVENT_LOGGER_SHUTDOWN_TIMEOUT_SECONDS)
   return nothing
 end
 

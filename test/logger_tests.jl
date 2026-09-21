@@ -113,6 +113,33 @@ function is_json_line(line::AbstractString)::Bool
   bytes = collect(codeunits(line))
   return json_value_end(bytes, 1) == length(bytes) + 1
 end
+mutable struct BlockingLoggerIO <: IO
+  entered::Base.Event
+  release::Base.Event
+end
+
+function Base.write(io::BlockingLoggerIO, value::String)::Int
+  notify(io.entered)
+  wait(io.release)
+  return ncodeunits(value)
+end
+
+Base.write(::BlockingLoggerIO, ::UInt8)::Int = 1
+Base.flush(::BlockingLoggerIO)::Nothing = nothing
+
+@testset "event logger default path" begin
+  fallback_path = joinpath(Sys.BINDIR, "War1gusAI.log")
+  withenv("WAR1GUS_AI_LOG_PATH" => nothing) do
+    @test War1gusAI.default_log_path() == fallback_path
+  end
+  withenv("WAR1GUS_AI_LOG_PATH" => "") do
+    @test War1gusAI.default_log_path() == fallback_path
+  end
+  withenv("WAR1GUS_AI_LOG_PATH" => "/tmp/custom-war1gus-ai.log") do
+    @test War1gusAI.default_log_path() == "/tmp/custom-war1gus-ai.log"
+  end
+end
+
 
 @testset "asynchronous JSON-lines event logger" begin
   War1gusAI.stop_event_logger!()
@@ -169,5 +196,29 @@ end
     War1gusAI.stop_event_logger!()
     rm(path; force=true)
     @isdefined(restart_path) && rm(restart_path; force=true)
+  end
+end
+
+@testset "event logger bounded shutdown" begin
+  War1gusAI.stop_event_logger!()
+  path = tempname()
+  stdout_io = BlockingLoggerIO(Base.Event(), Base.Event())
+  logger = nothing
+
+  try
+    @test War1gusAI.start_event_logger!(path=path, stdout_io=stdout_io) === nothing
+    logger = War1gusAI.EVENT_LOGGER[]
+    @test !isnothing(logger)
+    War1gusAI.log_event("blocked_writer")
+    wait(stdout_io.entered)
+
+    elapsed = @elapsed War1gusAI.stop_event_logger!()
+    @test elapsed < War1gusAI.EVENT_LOGGER_SHUTDOWN_TIMEOUT_SECONDS + 2.0
+    @test War1gusAI.EVENT_LOGGER[] === nothing
+  finally
+    notify(stdout_io.release)
+    War1gusAI.stop_event_logger!()
+    !isnothing(logger) && wait(logger.task)
+    rm(path; force=true)
   end
 end
