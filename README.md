@@ -74,13 +74,16 @@ policy seat, samples frozen opponents from a bounded snapshot league, and
 randomizes map, seat, and seed schedules. Training must use `--workers 1`,
 because its checkpoint and league are shared mutable state.
 
-Set the War1gus data directory for your installation, then resume or start
-training with the Forest observer map. This example intentionally omits
-`--reset`: if `$PWD/ai-training/checkpoint.jls` already exists, training
-resumes it and its `$PWD/ai-training/league/` snapshots.
+Set the War1gus data directory for your installation, then start a fresh
+coordinator run with the Forest observer map. The checkpoint and its sibling
+league are persistent mutable training state; `mktemp` creates a fresh unique
+`<run-id>` state and output directory beneath `ai-training/runs/` for each
+coordinator invocation.
 
 ```sh
 WAR1GUS_DATA_DIR="$HOME/.local/share/stratagus/data.War1gus"
+mkdir -p "$AI_ROOT/ai-training/runs"
+TRAIN_RUN_DIR="$(mktemp -d "$AI_ROOT/ai-training/runs/$(date -u +%Y%m%dT%H%M%S)-XXXXXX")"
 
 julia --project="$AI_ROOT" "$AI_ROOT/orchestrate.jl" train \
   --launcher "$WAR1GUS_ROOT/build/war1gus" \
@@ -88,10 +91,17 @@ julia --project="$AI_ROOT" "$AI_ROOT/orchestrate.jl" train \
   --rollout-config "$AI_ROOT/rollout.lua" \
   --map 'maps/Forest1AI-Observer(5).smp' \
   --matches 100 --workers 1 --timeout-cycles 18000 --seed 1 \
-  --state-root "$PWD/ai-training" \
-  --checkpoint "$PWD/ai-training/checkpoint.jls" \
-  --output "$PWD/ai-training/train.jsonl"
+  --state-root "$TRAIN_RUN_DIR" \
+  --checkpoint "$AI_ROOT/ai-training/checkpoint.jls" \
+  --output "$TRAIN_RUN_DIR/train.jsonl"
 ```
+
+This example intentionally omits `--reset`. That continues the model,
+optimizer, and checkpoint-sibling `league/` state from
+`$AI_ROOT/ai-training`, but it does **not** resume an interrupted coordinator
+schedule or its individual matches. A fresh run directory preserves every
+prior coordinator stream and match log. Reusing a state root and output path
+instead truncates its `train.jsonl` and launcher logs.
 
 Use `--reset` only when intentionally discarding the selected checkpoint and
 league; it requires an explicit `--checkpoint` and removes that checkpoint and
@@ -102,18 +112,22 @@ its sibling `league/` directory.
 Evaluation is read-only. Use a map excluded from the training schedule and the
 immutable training checkpoint. It reports per-map outcomes, win rate,
 elimination time, production, resource totals, and combat/asset-efficiency
-proxies as JSON Lines.
+proxies as JSON Lines. The example creates a fresh unique `<run-id>` directory
+under `ai-evaluation/runs/` for its state and output.
 
 ```sh
+mkdir -p "$AI_ROOT/ai-evaluation/runs"
+EVALUATION_RUN_DIR="$(mktemp -d "$AI_ROOT/ai-evaluation/runs/$(date -u +%Y%m%dT%H%M%S)-XXXXXX")"
+
 julia --project="$AI_ROOT" "$AI_ROOT/orchestrate.jl" evaluate \
   --launcher "$WAR1GUS_ROOT/build/war1gus" \
   --data-dir "$WAR1GUS_DATA_DIR" \
   --rollout-config "$AI_ROOT/rollout.lua" \
   --held-out-map 'maps/GoldRushAI-Max-Observer(5).smp' \
   --matches 20 --workers 4 --timeout-cycles 18000 --seed 2 \
-  --state-root "$PWD/ai-evaluation" \
-  --checkpoint "$PWD/ai-training/checkpoint.jls" \
-  --output "$PWD/ai-evaluation/evaluate.jsonl"
+  --state-root "$EVALUATION_RUN_DIR" \
+  --checkpoint "$AI_ROOT/ai-training/checkpoint.jls" \
+  --output "$EVALUATION_RUN_DIR/evaluate.jsonl"
 ```
 
 Pass `--league-snapshot PATH` to pin every frozen opponent to one compatible
@@ -129,20 +143,22 @@ network requests and responses, selected candidates, training samples, PPO
 updates, league assignments and snapshots, and episode finalization as JSON
 records with a `type` field.
 
-For coordinator runs, live files are under the state root:
+For coordinator runs, live files are under that invocation's run directory:
 
-- The coordinator stream is `$PWD/ai-training/train.jsonl` or
-  `$PWD/ai-evaluation/evaluate.jsonl`.
-- Each match has `$PWD/ai-training/matches/<match-id>/ai.jsonl` (or the
+- The coordinator stream is
+  `$AI_ROOT/ai-training/runs/<run-id>/train.jsonl` or
+  `$AI_ROOT/ai-evaluation/runs/<run-id>/evaluate.jsonl`.
+- Each match has
+  `$AI_ROOT/ai-training/runs/<run-id>/matches/<match-id>/ai.jsonl` (or the
   equivalent evaluation path) for AI JSON events.
 - The coordinator redirects **both child stdout and stderr** to that match's
   `launcher.log`; this includes engine output and the AI's stdout JSON events.
 
-To follow logs for match directories that already exist, run:
+To follow logs for training match directories that already exist, run:
 
 ```sh
-tail -q -f "$PWD"/ai-training/matches/*/ai.jsonl \
-  "$PWD"/ai-training/matches/*/launcher.log
+tail -q -f "$AI_ROOT"/ai-training/runs/*/matches/*/ai.jsonl \
+  "$AI_ROOT"/ai-training/runs/*/matches/*/launcher.log
 ```
 
 The shell expands this glob before `tail` starts, so it sees only match
