@@ -17,7 +17,8 @@ model_state_snapshot(policy) = deepcopy(Flux.state(policy))
   @test length(observation.entities) == 2
   @test length(observation.candidates) == 3
   @test War1gusAI.candidate_name(10) == "formation"
-  @test_throws ArgumentError War1gusAI.candidate_name(12)
+  @test War1gusAI.candidate_name(12) == "cast-spell"
+  @test_throws ArgumentError War1gusAI.candidate_name(13)
 
   policy = War1gusAI.create_policy(seed=17)
   scores = War1gusAI.candidate_scores(policy, observation)

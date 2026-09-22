@@ -10,11 +10,11 @@ const CANDIDATE_WORDS = 12
 const MAX_CANDIDATES = 512
 const MAX_STATE_WORDS = 65_536
 const MAX_ENTITY_COUNT = div(MAX_STATE_WORDS - STATE_HEADER_WORDS, ENTITY_WORDS)
-const CANDIDATE_KIND_COUNT = 12
+const CANDIDATE_KIND_COUNT = 13
 const EMBED_DIM = 48
 const HIDDEN_DIM = 96
 const CHECKPOINT_VERSION = 4
-const CATALOG_VERSION = 3
+const CATALOG_VERSION = 4
 const REWARD_VERSION = 3
 const POLICY_VERSION = 3
 const PPO_VERSION = 1
@@ -54,6 +54,7 @@ const CANDIDATE_NAMES = (
  "repair",
  "formation",
  "defend",
+ "cast-spell",
 )
 
 """Return the stable name for a v3 candidate kind."""

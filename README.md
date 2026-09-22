@@ -17,10 +17,11 @@ cadence, and production context.
 
 The Flux policy scores that producer-supplied catalog directly rather than
 selecting from a fixed action list. The catalog covers waiting, gathering gold
-or wood, legal building placement, per-structure training and research,
-entity-targeted attacks, group movement, exploration, repair, formations, and
-defence. Stratagus validates and executes the selected primitive command;
-Julia never emits Lua source.
+or wood, legal placement for every constructible race building, roads, walls,
+every trainable multiplayer unit, the complete base and rebalanced research
+trees, researched spell use, entity-targeted attacks, group movement,
+exploration, repair, formations, and defence. Stratagus validates and executes
+the selected primitive command; Julia never emits Lua source.
 
 Normal games use deterministic inference from the saved policy. Training uses
 stochastic on-policy PPO with a value head: rewarded trajectories improve the
@@ -107,7 +108,7 @@ julia --project="$AI_ROOT" "$AI_ROOT/orchestrate.jl" train \
   --launcher "$WAR1GUS_ROOT/build/war1gus" \
   --data-dir "$WAR1GUS_DATA_DIR" \
   --rollout-config "$AI_ROOT/rollout.lua" \
-  --map 'maps/Forest1AI-Observer(5).smp' \
+  --map 'maps/Forest1AI-Observer(3).smp' \
   --matches 100 --workers 1 --timeout-cycles 18000 --seed 1 \
   --state-root "$TRAIN_RUN_DIR" \
   --checkpoint "$AI_ROOT/ai-training/checkpoint.jls" \
