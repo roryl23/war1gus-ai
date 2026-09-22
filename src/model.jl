@@ -442,11 +442,14 @@ struct Decision
  action::Int
  log_probability::Float32
  value::Float32
+ policy_generation::Int
+ collectable::Bool
 end
 
 mutable struct ClientSession
  previous::Union{Nothing,Decision}
  fragment::Vector{TrajectoryStep}
+ fragment_generation::Union{Nothing,Int}
  last_sequence::Union{Nothing,UInt32}
  player::Union{Nothing,UInt32}
  trainable::Bool
@@ -454,12 +457,18 @@ mutable struct ClientSession
  finalized::Bool
 end
 
-ClientSession() = ClientSession(nothing, TrajectoryStep[], nothing, nothing, true, nothing, false)
+ClientSession() = ClientSession(nothing, TrajectoryStep[], nothing, nothing, nothing, true, nothing, false)
+
+struct PpoWorkerFailure
+ error
+ backtrace
+end
 
 mutable struct OnlineTrainer{O,R<:AbstractRNG}
  policy::AiPolicy
  optimizer_state::O
  lock::ReentrantLock
+ checkpoint_lock::ReentrantLock
  mode::Symbol
  read_only::Bool
  gamma::Float32
@@ -468,12 +477,17 @@ mutable struct OnlineTrainer{O,R<:AbstractRNG}
  value_coefficient::Float32
  entropy_coefficient::Float32
  update_count::Int
+ policy_generation::Int
  checkpoint_path::String
  batch_size::Int
  rollout_fragment::Int
  ppo_epochs::Int
  checkpoint_every::Int
  pending_fragments::Vector{TrajectoryFragment}
+ worker_active::Bool
+ worker_task::Union{Nothing,Task}
+ worker_failure::Union{Nothing,PpoWorkerFailure}
+ last_update_loss::Union{Nothing,Float32}
  rng::R
  train_player::UInt32
  league_snapshot_every::Int
@@ -529,22 +543,50 @@ function _refresh_league_snapshots!(trainer::OnlineTrainer)::Nothing
  return nothing
 end
 
-function _save_league_snapshot_locked!(trainer::OnlineTrainer)::String
+function _league_snapshot_paths(directory::AbstractString)::Vector{String}
+ !isdir(directory) && return String[]
+ return sort(
+  [joinpath(directory, name) for name in readdir(directory) if startswith(name, "snapshot-") && endswith(name, ".jls") && isfile(joinpath(directory, name))],
+ )
+end
+
+function _write_league_snapshot!(
+ trainer::OnlineTrainer,
+ policy::AiPolicy,
+ optimizer_state,
+ update_count::Int,
+)::String
  is_training(trainer) || throw(ArgumentError("read-only or evaluation trainers cannot save league snapshots"))
  directory = league_directory(trainer)
  mkpath(directory)
- path = joinpath(directory, "snapshot-$(lpad(trainer.update_count, 10, '0')).jls")
- save_policy_checkpoint!(path, trainer.policy, trainer.optimizer_state, trainer.update_count)
- _refresh_league_snapshots!(trainer)
- overflow = length(trainer.league_snapshots) - trainer.league_max_snapshots
+ path = joinpath(directory, "snapshot-$(lpad(update_count, 10, '0')).jls")
+ save_policy_checkpoint!(path, policy, optimizer_state, update_count)
+ return path
+end
+
+function _publish_league_snapshot_locked!(
+ trainer::OnlineTrainer,
+ path::String,
+)::Tuple{Vector{String},Int}
+ snapshots = sort(unique([trainer.league_snapshots; path]))
+ overflow = length(snapshots) - trainer.league_max_snapshots
  protected = trainer.league_snapshot_override
- removable = isnothing(protected) ? trainer.league_snapshots :
-             filter(snapshot -> snapshot != protected, trainer.league_snapshots)
- for stale in removable[1:min(max(overflow, 0), length(removable))]
-  rm(stale; force=true)
- end
- _refresh_league_snapshots!(trainer)
- log_event("league_snapshot"; update_count=trainer.update_count, path, retained=length(trainer.league_snapshots))
+ removable = isnothing(protected) ? snapshots : filter(snapshot -> snapshot != protected, snapshots)
+ stale = removable[1:min(max(overflow, 0), length(removable))]
+ trainer.league_snapshots = filter(snapshot -> !(snapshot in stale), snapshots)
+ return stale, length(trainer.league_snapshots)
+end
+
+function _remove_league_snapshots!(snapshots::Vector{String})::Nothing
+ foreach(snapshot -> rm(snapshot; force=true), snapshots)
+ return nothing
+end
+
+function _save_league_snapshot_locked!(trainer::OnlineTrainer)::String
+ path = _write_league_snapshot!(trainer, trainer.policy, trainer.optimizer_state, trainer.update_count)
+ stale, retained = _publish_league_snapshot_locked!(trainer, path)
+ _remove_league_snapshots!(stale)
+ log_event("league_snapshot"; update_count=trainer.update_count, path, retained)
  return path
 end
 
@@ -633,10 +675,11 @@ function create_trainer(
   load_policy_checkpoint!(selected_path, selected_policy, fresh_optimizer_state)
  end
  trainer = OnlineTrainer(
-  selected_policy, restored.optimizer_state, ReentrantLock(), mode, read_only, Float32(gamma), Float32(gae_lambda),
-  Float32(clip_epsilon), Float32(value_coefficient), Float32(entropy_coefficient), restored.update_count,
-  selected_path, Int(batch_size), Int(rollout_fragment), Int(ppo_epochs), Int(checkpoint_every),
-  TrajectoryFragment[], MersenneTwister(seed), train_player, Int(league_snapshot_every),
+  selected_policy, restored.optimizer_state, ReentrantLock(), ReentrantLock(), mode, read_only,
+  Float32(gamma), Float32(gae_lambda), Float32(clip_epsilon), Float32(value_coefficient),
+  Float32(entropy_coefficient), restored.update_count, 0, selected_path, Int(batch_size),
+  Int(rollout_fragment), Int(ppo_epochs), Int(checkpoint_every), TrajectoryFragment[], false,
+  nothing, nothing, nothing, MersenneTwister(seed), train_player, Int(league_snapshot_every),
   Int(league_max_snapshots), selected_league_path, selected_override, String[],
  )
  if is_league(trainer)
@@ -661,10 +704,21 @@ function create_trainer(
  return trainer
 end
 
+function _rethrow_worker_failure_locked!(trainer::OnlineTrainer)::Nothing
+ failure = trainer.worker_failure
+ isnothing(failure) && return nothing
+ throw((failure::PpoWorkerFailure).error)
+end
+
 function save_checkpoint!(trainer::OnlineTrainer)::Nothing
  is_training(trainer) || return nothing
- lock(trainer.lock) do
-  save_policy_checkpoint!(trainer.checkpoint_path, trainer.policy, trainer.optimizer_state, trainer.update_count)
+ lock(trainer.checkpoint_lock) do
+  policy, optimizer_state, update_count = lock(trainer.lock) do
+   _rethrow_worker_failure_locked!(trainer)
+   snapshot_policy, snapshot_optimizer = deepcopy((trainer.policy, trainer.optimizer_state))
+   return snapshot_policy, snapshot_optimizer, trainer.update_count
+  end
+  save_policy_checkpoint!(trainer.checkpoint_path, policy, optimizer_state, update_count)
  end
  return nothing
 end
@@ -731,46 +785,148 @@ function _ppo_loss(
  return total_loss / Float32(length(steps))
 end
 
-function _pending_step_count(trainer::OnlineTrainer)::Int
- return sum(length(fragment.steps) for fragment in trainer.pending_fragments)
+function _pending_step_count(fragments::Vector{TrajectoryFragment})::Int
+ return sum(length(fragment.steps) for fragment in fragments)
 end
 
-function _drain_pending_locked!(trainer::OnlineTrainer)::Union{Nothing,Float32}
- is_training(trainer) || return nothing
- isempty(trainer.pending_fragments) && return nothing
- fragments = trainer.pending_fragments
+_pending_step_count(trainer::OnlineTrainer)::Int = _pending_step_count(trainer.pending_fragments)
+
+function _train_ppo_snapshot!(
+ trainer::OnlineTrainer,
+ policy::AiPolicy,
+ optimizer_state,
+ fragments::Vector{TrajectoryFragment},
+)::Tuple{Float32,Int}
  steps, targets, advantages = trajectory_targets_and_advantages(trainer, fragments)
- isempty(steps) && return nothing
+ isempty(steps) && throw(ArgumentError("PPO update has no trajectory steps"))
  loss = 0.0f0
  for _ in 1:trainer.ppo_epochs
-  result = Flux.withgradient(trainer.policy) do policy
+  result = Flux.withgradient(policy) do trained_policy
    _ppo_loss(
-    policy, steps, targets, advantages, trainer.clip_epsilon,
+    trained_policy, steps, targets, advantages, trainer.clip_epsilon,
     trainer.value_coefficient, trainer.entropy_coefficient,
    )
   end
   loss = Float32(result.val)
   isfinite(loss) || throw(ArgumentError("PPO update produced a non-finite loss"))
-  Flux.update!(trainer.optimizer_state, trainer.policy, result.grad[1])
+  Flux.update!(optimizer_state, policy, result.grad[1])
  end
+ return loss, length(steps)
+end
+
+function _record_worker_failure!(trainer::OnlineTrainer, error, backtrace)::Nothing
+ lock(trainer.lock) do
+  trainer.worker_active = false
+  trainer.worker_failure = PpoWorkerFailure(error, backtrace)
+ end
+ log_event("ppo_update_failed"; error=sprint(showerror, error))
+ return nothing
+end
+
+function _run_ppo_update_worker!(
+ trainer::OnlineTrainer,
+ policy::AiPolicy,
+ optimizer_state,
+ fragments::Vector{TrajectoryFragment},
+ dispatched_generation::Int,
+)::Nothing
+ started_at = time_ns()
+ try
+  loss, step_count = _train_ppo_snapshot!(trainer, policy, optimizer_state, fragments)
+  update_count, checkpoint_due, league_snapshot_due = lock(trainer.lock) do
+   trainer.policy_generation == dispatched_generation ||
+    throw(ArgumentError("PPO worker published against an unexpected policy generation"))
+   trainer.policy = policy
+   trainer.optimizer_state = optimizer_state
+   trainer.update_count += 1
+   trainer.policy_generation += 1
+   trainer.last_update_loss = loss
+   return (
+    trainer.update_count,
+    trainer.update_count % trainer.checkpoint_every == 0,
+    is_league(trainer) && trainer.update_count % trainer.league_snapshot_every == 0,
+   )
+  end
+
+  if checkpoint_due
+   lock(trainer.checkpoint_lock) do
+    save_policy_checkpoint!(trainer.checkpoint_path, policy, optimizer_state, update_count)
+   end
+  end
+  snapshot_path = nothing
+  if league_snapshot_due
+   snapshot_path = _write_league_snapshot!(trainer, policy, optimizer_state, update_count)
+   stale, retained = lock(trainer.lock) do
+    return _publish_league_snapshot_locked!(trainer, snapshot_path)
+   end
+   _remove_league_snapshots!(stale)
+   log_event("league_snapshot"; update_count, path=snapshot_path, retained)
+  end
+
+  duration_ms = (time_ns() - started_at) / 1_000_000
+  lock(trainer.lock) do
+   trainer.worker_active = false
+  end
+
+  log_event(
+   "ppo_update";
+   update_count,
+   policy_generation=dispatched_generation + 1,
+   fragments=length(fragments),
+   steps=step_count,
+   epochs=trainer.ppo_epochs,
+   loss,
+   duration_ms,
+   checkpoint_due,
+   league_snapshot=snapshot_path,
+   gamma=trainer.gamma,
+   gae_lambda=trainer.gae_lambda,
+   clip_epsilon=trainer.clip_epsilon,
+  )
+ catch error
+  _record_worker_failure!(trainer, error, catch_backtrace())
+ end
+ return nothing
+end
+
+function _worker_busy_locked(trainer::OnlineTrainer)::Bool
+ task = trainer.worker_task
+ return trainer.worker_active || (!isnothing(task) && !istaskdone(task))
+end
+
+function _schedule_pending_update_locked!(trainer::OnlineTrainer; force::Bool=false)::Bool
+ is_training(trainer) || return false
+ _rethrow_worker_failure_locked!(trainer)
+ _worker_busy_locked(trainer) && return false
+ isempty(trainer.pending_fragments) && return false
+ !force && _pending_step_count(trainer) < trainer.batch_size && return false
+
+ fragments = trainer.pending_fragments
  trainer.pending_fragments = TrajectoryFragment[]
- trainer.update_count += 1
+ policy, optimizer_state = deepcopy((trainer.policy, trainer.optimizer_state))
+ dispatched_generation = trainer.policy_generation
+ trainer.worker_active = true
  log_event(
-  "ppo_update";
-  update_count=trainer.update_count,
+  "ppo_update_scheduled";
+  update_count=trainer.update_count + 1,
+  policy_generation=dispatched_generation,
   fragments=length(fragments),
-  steps=length(steps),
-  epochs=trainer.ppo_epochs,
-  loss,
-  gamma=trainer.gamma,
-  gae_lambda=trainer.gae_lambda,
-  clip_epsilon=trainer.clip_epsilon,
+  steps=_pending_step_count(fragments),
+  forced=force,
  )
- trainer.update_count % trainer.checkpoint_every == 0 &&
-  save_policy_checkpoint!(trainer.checkpoint_path, trainer.policy, trainer.optimizer_state, trainer.update_count)
- is_league(trainer) && trainer.update_count % trainer.league_snapshot_every == 0 &&
-  _save_league_snapshot_locked!(trainer)
- return loss
+ trainer.worker_task = Threads.@spawn begin
+  _run_ppo_update_worker!(trainer, policy, optimizer_state, fragments, dispatched_generation)
+ end
+ return true
+end
+
+function _discard_stale_fragment_locked!(trainer::OnlineTrainer, session::ClientSession)::Nothing
+ if !isnothing(session.fragment_generation) &&
+    session.fragment_generation != trainer.policy_generation
+  empty!(session.fragment)
+  session.fragment_generation = nothing
+ end
+ return nothing
 end
 
 function _submit_fragment_locked!(
@@ -778,11 +934,16 @@ function _submit_fragment_locked!(
  session::ClientSession,
  bootstrap_value::Float32,
  terminal::Bool,
-)::Union{Nothing,Float32}
+)::Nothing
+ _discard_stale_fragment_locked!(trainer, session)
  isempty(session.fragment) && return nothing
+ session.fragment_generation == trainer.policy_generation ||
+  throw(ArgumentError("trajectory fragment crossed a PPO policy generation"))
  push!(trainer.pending_fragments, TrajectoryFragment(copy(session.fragment), bootstrap_value, terminal))
  empty!(session.fragment)
- return _pending_step_count(trainer) >= trainer.batch_size ? _drain_pending_locked!(trainer) : nothing
+ session.fragment_generation = nothing
+ _schedule_pending_update_locked!(trainer)
+ return nothing
 end
 
 function _log_training_step(
@@ -843,6 +1004,7 @@ function process_step!(
 )::Int
  observation = parse_state(state)
  lock(trainer.lock) do
+  _rethrow_worker_failure_locked!(trainer)
   session.finalized && throw(ArgumentError("AI session for player $(session.player) is already finalized"))
   _assign_session_locked!(trainer, session, player_of(state))
   if !isnothing(session.last_sequence)
@@ -854,23 +1016,39 @@ function process_step!(
   end
 
   previous = session.previous
+  training = _training_session(trainer, session)
   if !isnothing(previous)
-   if _training_session(trainer, session)
-    push!(session.fragment, TrajectoryStep(previous.observation, previous.action, Float32(reward), previous.log_probability, previous.value, false))
+   if training && previous.collectable &&
+      previous.policy_generation == trainer.policy_generation &&
+      !_worker_busy_locked(trainer)
+    _discard_stale_fragment_locked!(trainer, session)
+    push!(
+     session.fragment,
+     TrajectoryStep(
+      previous.observation, previous.action, Float32(reward),
+      previous.log_probability, previous.value, false,
+     ),
+    )
+    session.fragment_generation = trainer.policy_generation
     if length(session.fragment) >= trainer.rollout_fragment
      _submit_fragment_locked!(trainer, session, Float32(value_estimate(trainer.policy, observation)), false)
     end
     _log_training_step(previous, reward, sequence, state, false)
+   elseif training
+    _discard_stale_fragment_locked!(trainer, session)
    end
    _log_reward_decomposition(state, sequence, reward, false)
   end
 
   active_policy = session.trainable ? trainer.policy : (session.frozen_policy::AiPolicy)
-  training = _training_session(trainer, session)
   action = select_action(active_policy, observation; training, rng=trainer.rng)
   log_probability, _ = candidate_log_probability_and_entropy(active_policy, observation, action)
   value = value_estimate(active_policy, observation)
-  session.previous = Decision(state, observation, action, Float32(log_probability), Float32(value))
+  collectable = training && !_worker_busy_locked(trainer)
+  session.previous = Decision(
+   state, observation, action, Float32(log_probability), Float32(value),
+   trainer.policy_generation, collectable,
+  )
   session.last_sequence = sequence
   return action
  end
@@ -886,6 +1064,7 @@ function process_terminal!(
 )::Bool
  parse_state(state; terminal=true)
  lock(trainer.lock) do
+  _rethrow_worker_failure_locked!(trainer)
   session.finalized && return false
   _assign_session_locked!(trainer, session, player_of(state))
   if !isnothing(session.last_sequence)
@@ -893,28 +1072,55 @@ function process_terminal!(
     throw(ArgumentError("out-of-order AI terminal sequence $sequence"))
   end
   previous = session.previous
-  if !isnothing(previous) && _training_session(trainer, session)
-   push!(session.fragment, TrajectoryStep(previous.observation, previous.action, Float32(reward), previous.log_probability, previous.value, true))
+  training = _training_session(trainer, session)
+  if !isnothing(previous) && training && previous.collectable &&
+     previous.policy_generation == trainer.policy_generation &&
+     !_worker_busy_locked(trainer)
+   _discard_stale_fragment_locked!(trainer, session)
+   push!(
+    session.fragment,
+    TrajectoryStep(
+     previous.observation, previous.action, Float32(reward),
+     previous.log_probability, previous.value, true,
+    ),
+   )
+   session.fragment_generation = trainer.policy_generation
    _submit_fragment_locked!(trainer, session, 0.0f0, true)
    _log_training_step(previous, reward, sequence, nothing, true)
+  elseif training
+   empty!(session.fragment)
+   session.fragment_generation = nothing
   end
   _log_reward_decomposition(state, sequence, reward, true)
   session.previous = nothing
   session.last_sequence = nothing
   session.finalized = true
-  if is_training(trainer)
-   _drain_pending_locked!(trainer)
-   save_policy_checkpoint!(trainer.checkpoint_path, trainer.policy, trainer.optimizer_state, trainer.update_count)
-  end
-  log_event("episode_finalized"; player=Int(player_of(state)), sequence, reward, trained=_training_session(trainer, session))
+  log_event("episode_finalized"; player=Int(player_of(state)), sequence, reward, trained=training)
   return true
  end
 end
 
-"""Flush queued trajectory fragments, preserving GAE bootstraps already captured at boundaries."""
+"""Force a partial update when needed, then wait until the PPO worker is fully idle."""
 function flush_trajectories!(trainer::OnlineTrainer)::Union{Nothing,Float32}
- lock(trainer.lock) do
-  return is_training(trainer) ? _drain_pending_locked!(trainer) : nothing
+ is_training(trainer) || return nothing
+ loss = nothing
+ while true
+  task = lock(trainer.lock) do
+   if _worker_busy_locked(trainer)
+    return trainer.worker_task
+   end
+   _rethrow_worker_failure_locked!(trainer)
+   if _schedule_pending_update_locked!(trainer; force=true)
+    return trainer.worker_task
+   end
+   return nothing
+  end
+  isnothing(task) && return loss
+  wait(task)
+  loss = lock(trainer.lock) do
+   _rethrow_worker_failure_locked!(trainer)
+   return trainer.last_update_loss
+  end
  end
 end
 
@@ -944,6 +1150,7 @@ function warmup_training_runtime!()::Nothing
  process_step!(trainer, session, UInt32(0), Int32(0), state)
  process_step!(trainer, session, UInt32(1), Int32(1), state)
  process_terminal!(trainer, session, UInt32(2), Int32(1), _warmup_state(terminal=true))
+ flush_trajectories!(trainer)
  return nothing
 end
 

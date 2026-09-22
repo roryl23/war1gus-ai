@@ -76,14 +76,15 @@ end
   @test all(isfinite, normalized_advantages)
 
   mktempdir() do directory
+    checkpoint = joinpath(directory, "ppo.jls")
     learner = War1gusAI.create_trainer(
       mode=War1gusAI.MODE_TRAIN,
-      checkpoint_path=joinpath(directory, "ppo.jls"),
+      checkpoint_path=checkpoint,
       seed=23,
       batch_size=2,
       rollout_fragment=16,
       ppo_epochs=2,
-      checkpoint_every=100,
+      checkpoint_every=1,
     )
     first = v3_state(player=4, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=1, actor=1, bootstrap=50)])
     second = v3_state(player=4, cycle=101, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=7, actor=1, x=30, bootstrap=70)])
@@ -94,13 +95,23 @@ end
     War1gusAI.process_step!(learner, session, UInt32(0), Int32(0), first)
     War1gusAI.process_step!(learner, session, UInt32(1), Int32(20), second)
     @test War1gusAI.process_terminal!(learner, session, UInt32(2), Int32(1_000), terminal)
+    task = learner.worker_task
+    @test !isnothing(task)
+    War1gusAI.flush_trajectories!(learner)
+    @test istaskdone(task::Task)
     @test learner.update_count == 1
+    @test learner.policy_generation == 1
     @test isempty(learner.pending_fragments)
     @test Flux.state(learner.policy) != before
+    payload = open(deserialize, checkpoint)
+    @test payload.update_count == 1
+    @test payload.model_state == Flux.state(learner.policy)
+    War1gusAI.flush_trajectories!(learner)
+    @test learner.update_count == 1
   end
 end
 
-@testset "terminal finalization attaches the last decision exactly once" begin
+@testset "terminal finalization only submits trajectory work" begin
   mktempdir() do directory
     trainer = War1gusAI.create_trainer(
       mode=War1gusAI.MODE_TRAIN,
@@ -116,10 +127,113 @@ end
     terminal = v3_state(player=9, candidates=Vector{UInt32}[], terminal_reward=-1_000)
     War1gusAI.process_step!(trainer, session, UInt32(0), Int32(0), live)
     @test War1gusAI.process_terminal!(trainer, session, UInt32(1), Int32(-1_000), terminal)
-    @test trainer.update_count == 1
-    @test isempty(trainer.pending_fragments)
+    @test trainer.update_count == 0
+    @test length(trainer.pending_fragments) == 1
+    @test isnothing(trainer.worker_task)
+    @test !trainer.worker_active
     @test !War1gusAI.process_terminal!(trainer, session, UInt32(1), Int32(-1_000), terminal)
     @test_throws ArgumentError War1gusAI.process_step!(trainer, session, UInt32(2), Int32(0), live)
+    @test !isnothing(War1gusAI.flush_trajectories!(trainer))
+    @test trainer.update_count == 1
+  end
+end
+
+@testset "single-flight PPO preserves request servicing and generations" begin
+  mktempdir() do directory
+    checkpoint = joinpath(directory, "single-flight.jls")
+    trainer = War1gusAI.create_trainer(
+      mode=War1gusAI.MODE_TRAIN,
+      checkpoint_path=checkpoint,
+      seed=33,
+      batch_size=1,
+      rollout_fragment=32,
+      ppo_epochs=1,
+      checkpoint_every=1,
+    )
+    training = War1gusAI.ClientSession()
+    partial = War1gusAI.ClientSession()
+    during_update = War1gusAI.ClientSession()
+    live = v3_state(player=13, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=7, actor=1)])
+    terminal = v3_state(player=13, candidates=Vector{UInt32}[], terminal_reward=99)
+    partial_live = v3_state(player=14, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=1, actor=1)])
+    partial_terminal = v3_state(player=14, candidates=Vector{UInt32}[], terminal_reward=7)
+    concurrent_live = v3_state(player=15, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=1, actor=1)])
+    concurrent_terminal = v3_state(player=15, candidates=Vector{UInt32}[], terminal_reward=8)
+
+    War1gusAI.process_step!(trainer, partial, UInt32(0), Int32(0), partial_live)
+    War1gusAI.process_step!(trainer, partial, UInt32(1), Int32(1), partial_live)
+    @test length(partial.fragment) == 1
+    @test partial.fragment_generation == 0
+
+    actor_policy = trainer.policy
+    actor_optimizer = trainer.optimizer_state
+    actor_state = model_state_snapshot(actor_policy)
+    task = lock(trainer.lock) do
+      War1gusAI.process_step!(trainer, training, UInt32(0), Int32(0), live)
+      @test War1gusAI.process_terminal!(trainer, training, UInt32(1), Int32(99), terminal)
+      scheduled = trainer.worker_task
+      @test !isnothing(scheduled)
+      @test trainer.worker_active
+      @test !istaskdone(scheduled::Task)
+      @test trainer.update_count == 0
+      @test trainer.policy === actor_policy
+      @test trainer.optimizer_state === actor_optimizer
+      @test Flux.state(trainer.policy) == actor_state
+      @test War1gusAI.process_step!(trainer, during_update, UInt32(0), Int32(0), concurrent_live) in 0:1
+      @test !(during_update.previous::War1gusAI.Decision).collectable
+      return scheduled
+    end
+
+    War1gusAI.flush_trajectories!(trainer)
+    @test istaskdone(task::Task)
+    @test trainer.update_count == 1
+    @test trainer.policy !== actor_policy
+    @test trainer.optimizer_state !== actor_optimizer
+    @test War1gusAI.process_terminal!(trainer, partial, UInt32(2), Int32(7), partial_terminal)
+    @test isempty(partial.fragment)
+    @test isnothing(partial.fragment_generation)
+    @test War1gusAI.process_terminal!(trainer, during_update, UInt32(1), Int32(8), concurrent_terminal)
+    War1gusAI.flush_trajectories!(trainer)
+    @test trainer.update_count == 1
+    @test trainer.policy_generation == 1
+    @test !trainer.worker_active
+    payload = open(deserialize, checkpoint)
+    @test payload.update_count == 1
+  end
+end
+
+@testset "PPO worker failures reach flushes and later requests" begin
+  mktempdir() do directory
+    log_path = joinpath(directory, "failed-update.jsonl")
+    trainer = War1gusAI.create_trainer(
+      mode=War1gusAI.MODE_TRAIN,
+      checkpoint_path=joinpath(directory, "failed-update.jls"),
+      seed=34,
+      batch_size=1,
+      rollout_fragment=1,
+      ppo_epochs=1,
+    )
+    trainer.entropy_coefficient = Float32(NaN)
+    session = War1gusAI.ClientSession()
+    live = v3_state(player=15, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=7, actor=1)])
+    terminal = v3_state(player=15, candidates=Vector{UInt32}[], terminal_reward=-5)
+
+    War1gusAI.start_event_logger!(path=log_path, stdout_io=devnull, mirror_to_stdout=false)
+    try
+      War1gusAI.process_step!(trainer, session, UInt32(0), Int32(0), live)
+      @test War1gusAI.process_terminal!(trainer, session, UInt32(1), Int32(-5), terminal)
+      task = trainer.worker_task
+      @test !isnothing(task)
+      @test_throws ArgumentError War1gusAI.flush_trajectories!(trainer)
+      @test istaskdone(task::Task)
+      @test !isnothing(trainer.worker_failure)
+      @test_throws ArgumentError War1gusAI.process_step!(
+        trainer, War1gusAI.ClientSession(), UInt32(0), Int32(0), live,
+      )
+    finally
+      War1gusAI.stop_event_logger!()
+    end
+    @test any(record -> occursin("\"type\":\"ppo_update_failed\"", record), readlines(log_path))
   end
 end
 
@@ -154,6 +268,7 @@ end
         War1gusAI.process_step!(trainer, second, UInt32(1), Int32(31), second_live)
         @test only(second.fragment).reward == 31.0f0
         @test War1gusAI.process_terminal!(trainer, second, UInt32(2), Int32(202), second_terminal)
+        @test !isnothing(War1gusAI.flush_trajectories!(trainer))
       finally
         War1gusAI.stop_event_logger!()
       end
@@ -190,6 +305,7 @@ end
       try
         War1gusAI.process_step!(trainer, session, UInt32(0), Int32(0), live)
         @test War1gusAI.process_terminal!(trainer, session, UInt32(1), Int32(17), terminal)
+        @test !isnothing(War1gusAI.flush_trajectories!(trainer))
       finally
         War1gusAI.stop_event_logger!()
       end
@@ -291,6 +407,8 @@ end
     @test War1gusAI.process_terminal!(evaluation, train_session, UInt32(1), Int32(1_000), terminal)
     @test evaluation.update_count == 0
     @test isempty(evaluation.pending_fragments)
+    @test !evaluation.worker_active
+    @test isnothing(evaluation.worker_task)
 
     read_only_path = joinpath(directory, "read-only.jls")
     readonly = withenv("WAR1GUS_AI_READ_ONLY" => "true") do
@@ -306,6 +424,8 @@ end
     War1gusAI.process_terminal!(readonly, readonly_session, UInt32(1), Int32(-1_000), readonly_terminal)
     @test readonly.update_count == 0
     @test !ispath(read_only_path)
+    @test !readonly.worker_active
+    @test isnothing(readonly.worker_task)
   end
 end
 

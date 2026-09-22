@@ -23,9 +23,16 @@ defence. Stratagus validates and executes the selected primitive command;
 Julia never emits Lua source.
 
 Normal games use deterministic inference from the saved policy. Training uses
-stochastic trajectory PPO with a value head. A checkpoint includes model and
-optimizer state plus protocol, observation shape, catalog, reward, policy, and
-PPO compatibility metadata.
+stochastic on-policy PPO with a value head: rewarded trajectories improve the
+policy that generated them. A single background worker trains each PPO batch on
+an isolated policy-and-optimizer copy while request handlers continue selecting
+actions with the last published inference policy. Collection pauses while that
+update is in flight, so no partial fragment crosses policy generations or
+becomes a stale backlog. When training completes, the worker atomically
+publishes the new policy. Shutdown waits for submitted work to finish and saves
+the final published state. A checkpoint includes model and optimizer state plus
+protocol, observation shape, catalog, reward, policy, and PPO compatibility
+metadata.
 
 ## Build and play
 
@@ -66,6 +73,17 @@ installed game-data copy. Set `WAR1GUS_AI_BINARY` to use a different executable.
 The child process starts only when an AI player needs it and closes when the
 game ends. `--train` enables online training; `--reset-train` deliberately
 removes the selected checkpoint and its sibling league before training.
+
+### Julia threads
+
+The packaged `War1gusAI` launcher exports `JULIA_NUM_THREADS=2` when the
+variable is unset, allowing network-facing inference and background PPO work
+to make progress concurrently. An explicit environment value takes precedence;
+for example:
+
+```sh
+JULIA_NUM_THREADS=4 "$AI_ROOT/build/bin/War1gusAI" --train
+```
 
 ## Headless training
 
@@ -138,18 +156,22 @@ snapshot instead of sampling the checkpoint's sibling `league/` directory.
 Asset value is each non-wall unit or building's gold-plus-wood cost multiplied
 by remaining-health fraction. Enemy asset loss produces positive progress,
 own asset loss and elapsed-time buckets are negative, and victory or defeat
-adds the terminal reward component. Logging is compact by default: Julia emits
-errors, server lifecycle, trainer and league configuration, league assignments
-and snapshots, PPO updates, and episode finalization as JSON records with a
-`type` field. Lua keeps
-lifecycle, terminal, and error records available. Set
-`WAR1GUS_AI_VERBOSE_LOG=1` to also emit high-frequency diagnostics: Julia
-`network_request`, `network_response`, `reward_decomposition`, and complete
-`training_sample` events, plus Lua reward and action records.
+adds the terminal reward component. Compact logs report errors, server
+lifecycle, trainer and league configuration, league assignments and snapshots,
+episode finalization, and PPO worker scheduling/completion information,
+including low-frequency queue and timing fields. Gradient work and periodic
+checkpoint or league-snapshot file I/O run in that worker rather than on the
+request-response path; gameplay continues with the most recently published
+policy during an update. `WAR1GUS_AI_VERBOSE_LOG=1` also emits high-frequency
+diagnostics: Julia `network_request`, `network_response`,
+`reward_decomposition`, and complete `training_sample` events, plus Lua reward
+and action records.
 
 Full `training_sample` records are diagnostics, not a training-data format.
-PPO trains synchronously from in-memory trajectories and persists its state in
-checkpoints; it does not replay JSONL logs.
+PPO trains from bounded in-memory trajectory batches; exactly one update may be
+in flight, rather than a general producer-consumer trajectory queue. Checkpoints
+persist PPO state, including the final worker-published policy during orderly
+shutdown; JSONL logs are not replayed for training.
 
 For coordinator runs, live files are under that invocation's run directory:
 
