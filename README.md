@@ -10,14 +10,15 @@ state remains owned by this submodule.
 Stratagus starts the compiled application on demand and communicates with it on
 localhost through its `AiProcessor*` TCP API. Protocol v3 carries a
 variable-length observation containing economy totals, reward components, and
-one record for every visible own, enemy, or resource entity. Lua supplies the
-complete catalog of legal choices for that decision; a choice includes its
-actor, optional target entity and map position, group/formation metadata,
-cadence, and production context.
+one record for every strategically relevant own, enemy, or resource entity.
+Neutral roads are counted for construction limits but omitted from policy
+observations. Lua supplies the complete catalog of legal choices for that
+decision; a choice includes its actor, optional target entity and map position,
+group/formation metadata, cadence, and production context.
 
 The Flux policy scores that producer-supplied catalog directly rather than
 selecting from a fixed action list. The catalog covers waiting, gathering gold
-or wood, legal placement for every constructible race building, roads, walls,
+or wood, bounded legal construction for every race building, roads, and walls,
 every trainable multiplayer unit, the complete base and rebalanced research
 trees, researched auto-targeted and position-targeted spell use, entity-targeted attacks, group movement,
 exploration, repair, formations, and defence. Stratagus validates and executes

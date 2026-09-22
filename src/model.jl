@@ -234,11 +234,21 @@ function _entity_embeddings(policy::AiPolicy, observation::StateObservation)
  return map(entity -> policy.entity_encoder(encode_entity(entity)), observation.entities)
 end
 
-function _global_context(policy::AiPolicy, observation::StateObservation)
+function _encoded_context(policy::AiPolicy, observation::StateObservation)
  header_embedding = policy.header_encoder(encode_header(observation.header))
  entity_embeddings = _entity_embeddings(policy, observation)
+ return header_embedding, entity_embeddings
+end
+
+function _entity_context(entity_embeddings)
+ return isempty(entity_embeddings) ? zeros(Float32, EMBED_DIM) :
+        reduce(+, entity_embeddings) ./ Float32(length(entity_embeddings))
+end
+
+function _global_context(policy::AiPolicy, observation::StateObservation)
+ header_embedding, entity_embeddings = _encoded_context(policy, observation)
  isempty(entity_embeddings) && return header_embedding, entity_embeddings
- return header_embedding .+ reduce(+, entity_embeddings) ./ Float32(length(entity_embeddings)), entity_embeddings
+ return header_embedding .+ _entity_context(entity_embeddings), entity_embeddings
 end
 
 function _entity_embedding_or_zero(entity_embeddings, index::Integer)
@@ -258,6 +268,20 @@ function _candidate_score(
         candidate_bootstrap_score(candidate)
 end
 
+"""Compute all actor and critic outputs from one shared state encoding."""
+function _policy_forward(policy::AiPolicy, observation::StateObservation)
+ isempty(observation.candidates) && throw(ArgumentError("terminal states have no selectable candidates"))
+ header_embedding, entity_embeddings = _encoded_context(policy, observation)
+ entity_context = _entity_context(entity_embeddings)
+ global_context = header_embedding .+ entity_context
+ scores = map(
+  candidate -> _candidate_score(policy, candidate, global_context, entity_embeddings),
+  observation.candidates,
+ )
+ value = only(policy.value_head(vcat(global_context, entity_context)))
+ return scores, value
+end
+
 """Score exactly the producer-supplied candidate sequence; no fixed action mask is used."""
 function candidate_scores(policy::AiPolicy, observation::StateObservation)
  isempty(observation.candidates) && throw(ArgumentError("terminal states have no selectable candidates"))
@@ -271,9 +295,7 @@ end
 
 function value_estimate(policy::AiPolicy, observation::StateObservation)
  global_context, entity_embeddings = _global_context(policy, observation)
- entity_context = isempty(entity_embeddings) ? zeros(Float32, EMBED_DIM) :
-                  reduce(+, entity_embeddings) ./ Float32(length(entity_embeddings))
- return only(policy.value_head(vcat(global_context, entity_context)))
+ return only(policy.value_head(vcat(global_context, _entity_context(entity_embeddings))))
 end
 
 function value_estimate(policy::AiPolicy, state::AbstractVector{<:Integer})
@@ -285,28 +307,47 @@ function candidate_distribution(policy::AiPolicy, observation::StateObservation)
  return scores, exp.(Flux.logsoftmax(scores))
 end
 
+function _candidate_log_probability_and_entropy(scores::AbstractVector{<:Real}, action::Integer)
+ 0 <= action < length(scores) ||
+  throw(ArgumentError("candidate index $action is outside the supplied candidate sequence"))
+ log_probabilities = Flux.logsoftmax(scores)
+ return log_probabilities[Int(action)+1], -sum(exp.(log_probabilities) .* log_probabilities)
+end
+
 function candidate_log_probability_and_entropy(
  policy::AiPolicy,
  observation::StateObservation,
  action::Integer,
 )
- 0 <= action < length(observation.candidates) ||
-  throw(ArgumentError("candidate index $action is outside the supplied candidate sequence"))
- scores = candidate_scores(policy, observation)
- log_probabilities = Flux.logsoftmax(scores)
- return log_probabilities[Int(action)+1], -sum(exp.(log_probabilities) .* log_probabilities)
+ return _candidate_log_probability_and_entropy(candidate_scores(policy, observation), action)
+end
+
+function _sample_from_log_probabilities(log_probabilities::AbstractVector{<:Real}, rng::AbstractRNG)::Int
+ isempty(log_probabilities) && throw(ArgumentError("cannot sample an empty candidate sequence"))
+ threshold = rand(rng)
+ cumulative = zero(eltype(log_probabilities))
+ for (index, log_probability) in enumerate(log_probabilities)
+  cumulative += exp(log_probability)
+  threshold <= cumulative && return index - 1
+ end
+ return length(log_probabilities) - 1
 end
 
 function sample_candidate(scores::AbstractVector{<:Real}, rng::AbstractRNG)::Int
- isempty(scores) && throw(ArgumentError("cannot sample an empty candidate sequence"))
- probabilities = exp.(Flux.logsoftmax(scores))
- threshold = rand(rng)
- cumulative = zero(eltype(probabilities))
- for (index, probability) in enumerate(probabilities)
-  cumulative += probability
-  threshold <= cumulative && return index - 1
- end
- return length(scores) - 1
+ return _sample_from_log_probabilities(Flux.logsoftmax(scores), rng)
+end
+
+function _select_action(
+ scores::AbstractVector{<:Real},
+ log_probabilities::AbstractVector{<:Real};
+ training::Bool,
+ rng::AbstractRNG,
+)::Int
+ return training ? _sample_from_log_probabilities(log_probabilities, rng) : argmax(scores) - 1
+end
+
+function _select_action(scores::AbstractVector{<:Real}; training::Bool, rng::AbstractRNG)::Int
+ return training ? sample_candidate(scores, rng) : argmax(scores) - 1
 end
 
 """Choose greedily for inference and stochastically from supplied candidates during training."""
@@ -316,8 +357,7 @@ function select_action(
  training::Bool=false,
  rng::AbstractRNG=Random.default_rng(),
 )::Int
- scores = candidate_scores(policy, observation)
- return training ? sample_candidate(scores, rng) : argmax(scores) - 1
+ return _select_action(candidate_scores(policy, observation); training, rng)
 end
 
 function select_action(policy::AiPolicy, state::AbstractVector{<:Integer}; kwargs...)::Int
@@ -771,12 +811,12 @@ function _ppo_loss(
  total_loss = 0.0f0
  for index in eachindex(steps)
   step = steps[index]
-  log_probability, entropy = candidate_log_probability_and_entropy(policy, step.observation, step.action)
+  scores, value = _policy_forward(policy, step.observation)
+  log_probability, entropy = _candidate_log_probability_and_entropy(scores, step.action)
   ratio = exp(log_probability - step.old_log_probability)
   unclipped_policy = ratio * advantages[index]
   clipped_policy = clamp(ratio, 1.0f0 - clip_epsilon, 1.0f0 + clip_epsilon) * advantages[index]
   actor_loss = -min(unclipped_policy, clipped_policy)
-  value = value_estimate(policy, step.observation)
   unclipped_value_loss = (value - targets[index])^2
   clipped_value = step.old_value + clamp(value - step.old_value, -clip_epsilon, clip_epsilon)
   clipped_value_loss = (clipped_value - targets[index])^2
@@ -1018,6 +1058,8 @@ function process_step!(
 
   previous = session.previous
   training = _training_session(trainer, session)
+  active_policy = session.trainable ? trainer.policy : (session.frozen_policy::AiPolicy)
+  scores, value = _policy_forward(active_policy, observation)
   if !isnothing(previous)
    if training && previous.collectable &&
       previous.policy_generation == trainer.policy_generation &&
@@ -1032,7 +1074,7 @@ function process_step!(
     )
     session.fragment_generation = trainer.policy_generation
     if length(session.fragment) >= trainer.rollout_fragment
-     _submit_fragment_locked!(trainer, session, Float32(value_estimate(trainer.policy, observation)), false)
+     _submit_fragment_locked!(trainer, session, Float32(value), false)
     end
     _log_training_step(previous, reward, sequence, state, false)
    elseif training
@@ -1041,10 +1083,9 @@ function process_step!(
    _log_reward_decomposition(state, sequence, reward, false)
   end
 
-  active_policy = session.trainable ? trainer.policy : (session.frozen_policy::AiPolicy)
-  action = select_action(active_policy, observation; training, rng=trainer.rng)
-  log_probability, _ = candidate_log_probability_and_entropy(active_policy, observation, action)
-  value = value_estimate(active_policy, observation)
+  log_probabilities = Flux.logsoftmax(scores)
+  action = _select_action(scores, log_probabilities; training, rng=trainer.rng)
+  log_probability = log_probabilities[action+1]
   collectable = training && !_worker_busy_locked(trainer)
   session.previous = Decision(
    state, observation, action, Float32(log_probability), Float32(value),
