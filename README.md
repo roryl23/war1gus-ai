@@ -19,7 +19,7 @@ The Flux policy scores that producer-supplied catalog directly rather than
 selecting from a fixed action list. The catalog covers waiting, gathering gold
 or wood, legal placement for every constructible race building, roads, walls,
 every trainable multiplayer unit, the complete base and rebalanced research
-trees, researched spell use, entity-targeted attacks, group movement,
+trees, researched auto-targeted and position-targeted spell use, entity-targeted attacks, group movement,
 exploration, repair, formations, and defence. Stratagus validates and executes
 the selected primitive command; Julia never emits Lua source.
 
