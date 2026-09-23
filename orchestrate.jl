@@ -524,6 +524,24 @@ function validate_runtime_paths(options)
   options.league_snapshot === nothing || isfile(options.league_snapshot) ||
    throw(ArgumentError("--league-snapshot must name a file"))
  end
+ return nothing
+end
+
+function sync_runtime_files(options)
+ source_dir = abspath(joinpath(@__DIR__, "..", "..", ".."))
+ script = joinpath(source_dir, "cmake", "sync-runtime.cmake")
+ isfile(script) || throw(ArgumentError("runtime sync script is missing: $script"))
+ data_dir = abspath(options.data_dir)
+ try
+  run(addenv(`cmake -DWAR1GUS_SOURCE_DIR=$source_dir -DWAR1GUS_DATA_DIR=$data_dir -P $script`,
+   "LD_LIBRARY_PATH" => nothing))
+ catch error
+  throw(ErrorException("runtime sync failed for --data-dir $(options.data_dir): $(sprint(showerror, error))"))
+ end
+ return nothing
+end
+
+function validate_selected_maps(options)
  maps = options.mode == "train" ? options.maps : options.held_out_maps
  for map in maps
   path = rollout_map_path(options, map)
@@ -533,6 +551,8 @@ function validate_runtime_paths(options)
 end
 function run_orchestration(options)
  validate_runtime_paths(options)
+ sync_runtime_files(options)
+ validate_selected_maps(options)
  options.mode == "train" && options.reset && reset_training_state!(options)
  schedule = build_schedule(options)
  mkpath(dirname(options.output))

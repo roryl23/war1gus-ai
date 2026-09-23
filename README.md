@@ -62,6 +62,13 @@ point in a subshell:
 (cd "$WAR1GUS_ROOT" && bash build.sh War1gus)
 ```
 
+The full build and `build.sh War1gus` refresh source-owned Lua scripts and maps
+in the extracted data directory after installation. Set `WAR1GUS_DATA_DIR` to
+override the default `$XDG_DATA_HOME/stratagus/data.War1gus` (or
+`~/.local/share/stratagus/data.War1gus`); builds skip this step if extraction
+has not yet created `war1data`. Generated configuration, extracted Warcraft
+assets, and training state are not replaced.
+
 Launch the game from its root so the Lua integration can resolve the submodule
 binary:
 
@@ -104,6 +111,11 @@ The rollout coordinator runs repeatable headless matches. It trains one mutable
 policy seat, samples frozen opponents from a bounded snapshot league, and
 randomizes map, seat, and seed schedules. Training must use `--workers 1`,
 because its checkpoint and league are shared mutable state.
+
+The coordinator also refreshes those files in `--data-dir` before validating
+selected maps or resetting a checkpoint. Direct training and evaluation runs
+therefore do not require a separate build solely to sync changed scripts or
+maps. This step requires CMake and an extracted `war1data` directory.
 
 Set the War1gus data directory for your installation, then start a fresh
 coordinator run with the Forest observer map. The checkpoint and its sibling
