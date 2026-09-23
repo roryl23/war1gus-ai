@@ -109,6 +109,7 @@ CustomStartup = function()
 
   MapLoadedFuncs:add(function()
     SetGameSpeed(75)
+    local fast_forward_enabled = false
 
     AddTrigger(
       function()
@@ -130,6 +131,11 @@ CustomStartup = function()
       end)
     AddTrigger(
       function()
+        -- CreateGame resets fast-forward after MapLoaded; enable it here instead.
+        if not fast_forward_enabled then
+          SetFastForwardCycle(rollout_timeout)
+          fast_forward_enabled = true
+        end
         return not terminal_emitted and GameCycle >= rollout_timeout
       end,
       function()

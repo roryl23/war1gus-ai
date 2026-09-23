@@ -1,3 +1,4 @@
+import ChainRulesCore
 using Flux
 using LinearAlgebra
 using Random
@@ -998,32 +999,7 @@ function trajectory_targets_and_advantages(trainer::OnlineTrainer, fragments::Ve
  return steps, targets, Float32.(normalized)
 end
 
-function _ppo_loss(
- policy::AiPolicy,
- steps::Vector{TrajectoryStep},
- targets::Vector{Float32},
- advantages::Vector{Float32},
- clip_epsilon::Float32,
- value_coefficient::Float32,
- entropy_coefficient::Float32,
-)
- total_loss = 0.0f0
- for index in eachindex(steps)
-  step = steps[index]
-  scores, value = _policy_forward(policy, step.observation)
-  log_probability, entropy = _candidate_log_probability_and_entropy(scores, step.action)
-  ratio = exp(log_probability - step.old_log_probability)
-  unclipped_policy = ratio * advantages[index]
-  clipped_policy = clamp(ratio, 1.0f0 - clip_epsilon, 1.0f0 + clip_epsilon) * advantages[index]
-  actor_loss = -min(unclipped_policy, clipped_policy)
-  unclipped_value_loss = (value - targets[index])^2
-  clipped_value = step.old_value + clamp(value - step.old_value, -clip_epsilon, clip_epsilon)
-  clipped_value_loss = (clipped_value - targets[index])^2
-  critic_loss = 0.5f0 * max(unclipped_value_loss, clipped_value_loss)
-  total_loss += actor_loss + value_coefficient * critic_loss - entropy_coefficient * entropy
- end
- return total_loss / Float32(length(steps))
-end
+include("training.jl")
 
 function _pending_step_count(fragments::Vector{TrajectoryFragment})::Int
  return sum(length(fragment.steps) for fragment in fragments)
@@ -1040,10 +1016,11 @@ function _train_ppo_snapshot!(
  steps, targets, advantages = trajectory_targets_and_advantages(trainer, fragments)
  isempty(steps) && throw(ArgumentError("PPO update has no trajectory steps"))
  loss = 0.0f0
+ batch = _pack_ppo_batch(steps, targets, advantages)
  for _ in 1:trainer.ppo_epochs
   result = Flux.withgradient(policy) do trained_policy
    _ppo_loss(
-    trained_policy, steps, targets, advantages, trainer.clip_epsilon,
+    trained_policy, batch, trainer.clip_epsilon,
     trainer.value_coefficient, trainer.entropy_coefficient,
    )
   end

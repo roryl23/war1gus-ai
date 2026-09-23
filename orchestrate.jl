@@ -84,18 +84,66 @@ function parse_options(arguments::Vector{String})
   rollout_config=values[:rollout_config])
 end
 
+"""Read the selected map's literal player roster; never execute map Lua to discover seats."""
+function map_trainable_seats(options, map::AbstractString)
+ path = rollout_map_path(options, map)
+ isfile(path) || throw(ArgumentError("selected map is not a file: $path"))
+ endswith(lowercase(path), ".smp") ||
+  throw(ArgumentError("selected map must be a .smp presentation: $path"))
+ presentation = read(path, String)
+ declarations = collect(eachmatch(
+  r"(?m)^[ \t]*DefinePlayerTypes[ \t]*\(([^\r\n()]*)\)[ \t]*(?:--[^\r\n]*)?$",
+  presentation))
+ length(declarations) == 1 ||
+  throw(ArgumentError("map has no unique literal DefinePlayerTypes roster: $path"))
+ roster = declarations[1].captures[1]
+ occursin(r"^\s*\"[A-Za-z]+\"(?:\s*,\s*\"[A-Za-z]+\")*\s*$", roster) ||
+  throw(ArgumentError("map has unsupported DefinePlayerTypes roster: $path"))
+ player_types = [entry.captures[1] for entry in eachmatch(r"\"([A-Za-z]+)\"", roster)]
+ all(type -> type in ("computer", "person", "nobody", "neutral"), player_types) ||
+  throw(ArgumentError("map has unsupported player types: $path"))
+ length(player_types) <= 16 ||
+  throw(ArgumentError("map has more than 16 player slots: $path"))
+
+ setup_path = path[1:end-4] * ".sms"
+ isfile(setup_path) || throw(ArgumentError("selected map has no .sms setup: $setup_path"))
+ # Direct, literal assignments identify a different AI when present. Other
+ # computer seats may receive their AI through Load() or setup code, so the
+ # presentation roster remains authoritative when no direct assignment exists.
+ ai_types = Dict{Int,String}()
+ for line in eachline(setup_path)
+  assignment = match(r"^[ \t]*SetAiType[ \t]*\([ \t]*(\d+)[ \t]*,[ \t]*\"([A-Za-z0-9_-]+)\"[ \t]*\)[ \t]*(?:--.*)?$", line)
+  assignment === nothing && continue
+  seat = parse(Int, assignment.captures[1])
+  if haskey(ai_types, seat) && ai_types[seat] != assignment.captures[2]
+   throw(ArgumentError("map has conflicting AI assignments for seat $seat: $setup_path"))
+  end
+  ai_types[seat] = assignment.captures[2]
+ end
+ seats = [index - 1 for (index, player_type) in enumerate(player_types)
+          if player_type == "computer" && get(ai_types, index - 1, "war1gus-ai") == "war1gus-ai"]
+ isempty(seats) &&
+  throw(ArgumentError("map has no eligible computer seats for war1gus-ai: $path"))
+ return seats
+end
+
 """Construct a reproducible, precomputed match schedule so worker ordering cannot affect it."""
 function build_schedule(options)
  rng = MersenneTwister(options.seed)
  maps = options.mode == "train" ? options.maps : options.held_out_maps
+ eligible_seats = [map_trainable_seats(options, map) for map in maps]
  map_order = options.mode == "train" ? shuffle(rng, collect(eachindex(maps))) : Int[]
- seat_order = options.mode == "train" ? shuffle(rng, collect(0:3)) : Int[]
- evaluation_seat = Int(mod(UInt(options.seed), UInt(4)))
+ seat_orders = options.mode == "train" ? [shuffle(rng, seats) for seats in eligible_seats] : Vector{Int}[]
+ seat_counts = zeros(Int, length(maps))
  schedule = NamedTuple[]
  child_seeds = Set{Int}()
  for ordinal in 1:options.matches
-  map = options.mode == "train" ? maps[map_order[mod1(ordinal, length(map_order))]] : rand(rng, maps)
-  seat = options.mode == "train" ? seat_order[mod1(ordinal, length(seat_order))] : evaluation_seat
+  map_index = options.mode == "train" ? map_order[mod1(ordinal, length(map_order))] : rand(rng, eachindex(maps))
+  map = maps[map_index]
+  seat_counts[map_index] += 1
+  seats = options.mode == "train" ? seat_orders[map_index] : eligible_seats[map_index]
+  seat = options.mode == "train" ? seats[mod1(seat_counts[map_index], length(seats))] :
+         seats[Int(mod(UInt(options.seed), UInt(length(seats))))+1]
   child_seed = rand(rng, 1:typemax(Int32))
   while child_seed in child_seeds
    child_seed = rand(rng, 1:typemax(Int32))
@@ -553,8 +601,8 @@ function run_orchestration(options)
  validate_runtime_paths(options)
  sync_runtime_files(options)
  validate_selected_maps(options)
- options.mode == "train" && options.reset && reset_training_state!(options)
  schedule = build_schedule(options)
+ options.mode == "train" && options.reset && reset_training_state!(options)
  mkpath(dirname(options.output))
  mkpath(options.state_root)
  failures = Any[]

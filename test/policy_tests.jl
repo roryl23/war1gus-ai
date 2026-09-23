@@ -5,6 +5,151 @@ using Statistics
 
 model_state_snapshot(policy) = deepcopy(Flux.state(policy))
 
+# The pre-packing PPO objective, kept here as an independent scalar oracle.
+function scalar_ppo_reference(policy, steps, targets, advantages, clip_epsilon, value_coefficient, entropy_coefficient)
+  total_loss = 0.0f0
+  for index in eachindex(steps)
+    step = steps[index]
+    scores, value = War1gusAI._policy_forward(policy, step.observation)
+    log_probabilities = Flux.logsoftmax(scores)
+    log_probability = log_probabilities[step.action+1]
+    entropy = -sum(exp.(log_probabilities) .* log_probabilities)
+    ratio = exp(log_probability - step.old_log_probability)
+    actor_loss = -min(
+      ratio * advantages[index],
+      clamp(ratio, 1.0f0 - clip_epsilon, 1.0f0 + clip_epsilon) * advantages[index],
+    )
+    unclipped_value_loss = (value - targets[index])^2
+    clipped_value = step.old_value + clamp(value - step.old_value, -clip_epsilon, clip_epsilon)
+    clipped_value_loss = (clipped_value - targets[index])^2
+    total_loss += actor_loss +
+                  value_coefficient * 0.5f0 * max(unclipped_value_loss, clipped_value_loss) -
+                  entropy_coefficient * entropy
+  end
+  return total_loss / Float32(length(steps))
+end
+
+function policy_gradient_arrays(gradient)
+  return (
+    gradient.header_encoder.weight, gradient.header_encoder.bias,
+    gradient.entity_encoder.weight, gradient.entity_encoder.bias,
+    gradient.candidate_encoder.weight, gradient.candidate_encoder.bias,
+    gradient.score_head.layers[1].weight, gradient.score_head.layers[1].bias,
+    gradient.score_head.layers[2].weight, gradient.score_head.layers[2].bias,
+    gradient.value_head.layers[1].weight, gradient.value_head.layers[1].bias,
+    gradient.value_head.layers[2].weight, gradient.value_head.layers[2].bias,
+  )
+end
+
+@testset "packed PPO matches scalar objective and every trainable gradient" begin
+  policy = War1gusAI.create_policy(seed=43)
+  observations = [
+    War1gusAI.parse_state(v3_state(
+      cycle=101,
+      entities=[v3_entity(slot=1, hp=20), v3_entity(slot=2, role=3), v3_entity(slot=3, relation=2)],
+      candidates=[
+        v3_candidate(),
+        v3_candidate(kind=6, actor=3, target=1, bootstrap=400),
+        v3_candidate(kind=7, actor=0, target=2, x=40),
+        v3_candidate(kind=6, actor=1, target=3, bootstrap=-300),
+        v3_candidate(kind=8, actor=3, target=3, bootstrap=200),
+      ],
+    )),
+    War1gusAI.parse_state(v3_state(
+      cycle=202, entities=[v3_entity(slot=9, role=2, hp=37)],
+      candidates=[
+        v3_candidate(),
+        v3_candidate(kind=8, actor=1, target=1, bootstrap=-450),
+        v3_candidate(kind=7, actor=0, target=1, x=85),
+      ],
+    )),
+    War1gusAI.parse_state(v3_state(
+      cycle=303, entities=Vector{UInt32}[],
+      candidates=[
+        v3_candidate(),
+        v3_candidate(kind=7, x=14),
+        v3_candidate(kind=0, bootstrap=12_000),
+        v3_candidate(kind=7, x=90, bootstrap=-100),
+      ],
+    )),
+    War1gusAI.parse_state(v3_state(
+      cycle=404, entities=[v3_entity(slot=4, hp=53), v3_entity(slot=5, relation=3, role=2)],
+      candidates=[
+        v3_candidate(),
+        v3_candidate(kind=6, actor=2, target=1),
+        v3_candidate(kind=6, actor=1, target=2, bootstrap=550),
+      ],
+    )),
+  ]
+  actions = [3, 2, 2, 1] # Zero-based catalog indices, including the concentrated logit.
+  ratios = Float32[1.6, 0.5, 1.05, 0.95]
+  advantages = Float32[1.0, -0.8, 0.6, -0.7]
+  targets = Float32[]
+  steps = War1gusAI.TrajectoryStep[]
+  for index in eachindex(observations)
+    scores, value = War1gusAI._policy_forward(policy, observations[index])
+    log_probability = Flux.logsoftmax(scores)[actions[index]+1]
+    old_value = value - 1.0f0
+    # Both max branches: target above the current value selects the clipped
+    # critic; target at the old value selects the unclipped critic.
+    push!(targets, index in (1, 3) ? value + 1.0f0 : old_value)
+    push!(steps, War1gusAI.TrajectoryStep(
+      observations[index], actions[index], 0.0f0,
+      log_probability - log(ratios[index]), old_value, false,
+    ))
+  end
+  clip_epsilon, value_coefficient, entropy_coefficient = 0.2f0, 0.5f0, 0.01f0
+  batch = War1gusAI._pack_ppo_batch(steps, targets, advantages)
+  scalar = Flux.withgradient(policy) do trained_policy
+    scalar_ppo_reference(
+      trained_policy, steps, targets, advantages, clip_epsilon,
+      value_coefficient, entropy_coefficient,
+    )
+  end
+  packed = Flux.withgradient(policy) do trained_policy
+    War1gusAI._ppo_loss(
+      trained_policy, batch, clip_epsilon, value_coefficient, entropy_coefficient,
+    )
+  end
+  @test packed.val ≈ scalar.val atol = 2f-5 rtol = 2f-5
+  for (actual, expected) in zip(policy_gradient_arrays(packed.grad[1]), policy_gradient_arrays(scalar.grad[1]))
+    # Matmul over packed columns changes Float32 reduction order from the
+    # scalar path, particularly through the segmented entity mean.
+    @test actual ≈ expected atol = 3f-5 rtol = 3f-4
+  end
+end
+
+@testset "entity-free PPO does not advance Adam's entity momentum" begin
+  policy = War1gusAI.create_policy(seed=47)
+  optimizer_state = Flux.setup(Flux.Adam(1.0f-3), policy)
+  with_entity = War1gusAI.parse_state(v3_state(
+    entities=[v3_entity(slot=1, hp=35)],
+    candidates=[v3_candidate(), v3_candidate(kind=7, actor=1, x=51)],
+  ))
+  without_entity = War1gusAI.parse_state(v3_state(
+    entities=Vector{UInt32}[],
+    candidates=[v3_candidate(), v3_candidate(kind=7, x=51)],
+  ))
+  for observation in (with_entity, without_entity)
+    scores, value = War1gusAI._policy_forward(policy, observation)
+    step = War1gusAI.TrajectoryStep(
+      observation, 1, 0.0f0, Flux.logsoftmax(scores)[2], value, false,
+    )
+    batch = War1gusAI._pack_ppo_batch([step], Float32[value+1], Float32[0.7])
+    result = Flux.withgradient(policy) do trained_policy
+      War1gusAI._ppo_loss(trained_policy, batch, 0.2f0, 0.5f0, 0.01f0)
+    end
+    if observation === without_entity
+      @test isnothing(result.grad[1].entity_encoder)
+      before = deepcopy(Flux.state(policy).entity_encoder)
+      Flux.update!(optimizer_state, policy, result.grad[1])
+      @test Flux.state(policy).entity_encoder == before
+    else
+      Flux.update!(optimizer_state, policy, result.grad[1])
+    end
+  end
+end
+
 @testset "variable entity and candidate policy" begin
   entities = Vector{UInt32}[v3_entity(slot=1, relation=1, role=1), v3_entity(slot=2, relation=2, role=3, hp=45)]
   candidates = Vector{UInt32}[

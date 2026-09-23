@@ -26,10 +26,15 @@ commands as one bounded batch before execution; Julia never emits Lua source.
 
 Runtime evaluation batches the entity and candidate encoders into reusable
 per-player CPU buffers and projects the shared context once per request. PPO
-differentiation retains the Flux forward path with the same Float32 weights and
-feature encodings; checkpoints require no migration. Batched arithmetic can
-differ from scalar evaluation by Float32 rounding. TCP frames are bulk-decoded,
-and each selected index is sent in one four-byte write with `TCP_NODELAY`.
+packs trajectory features once per batch and evaluates all observations through
+batched Flux layers. Fused entity-pooling/reference and categorical-reduction
+derivatives avoid allocating a full-batch gradient for each observation.
+Activations are recomputed after every optimizer update; GAE, clipping,
+optimizer behavior, and the default four full-batch epochs are unchanged.
+Weights and features remain Float32, and checkpoints require no migration.
+Batched arithmetic can differ from scalar evaluation by Float32 rounding.
+TCP frames are bulk-decoded, and each selected index is sent in one four-byte
+write with `TCP_NODELAY`.
 
 Normal games use deterministic inference from the saved policy. Training uses
 stochastic on-policy PPO with a value head: rewarded trajectories improve the
@@ -62,12 +67,19 @@ julia --project="$AI_ROOT" -e 'using Pkg; Pkg.instantiate()'
 bash "$AI_ROOT/build.sh"
 ```
 
-To build the War1gus executable from this directory, run its root build entry
-point in a subshell:
+Rebuild both Stratagus and War1gus from this directory. The coordinator requires
+the current engine's `SetFastForwardCycle` binding and synchronous socket
+readiness support; compiling Julia alone does not update either. These root
+build stages install system-wide and may request `sudo`:
 
 ```sh
-(cd "$WAR1GUS_ROOT" && bash build.sh War1gus)
+(cd "$WAR1GUS_ROOT" && bash build.sh Stratagus && bash build.sh War1gus)
 ```
+
+For a local CMake build instead, configure War1gus with `STRATAGUS` pointing to
+the rebuilt engine executable and `STRATAGUS_INCLUDE_DIR` pointing to
+`"$WAR1GUS_ROOT/stratagus/gameheaders"`. An existing launcher can otherwise keep
+using an older installed engine even after the local engine is rebuilt.
 
 The full build and `build.sh War1gus` refresh source-owned Lua scripts and maps
 in the extracted data directory after installation. Set `WAR1GUS_DATA_DIR` to
@@ -98,6 +110,9 @@ decision as an atomic network command batch; clients execute the same batch
 without opening an AI connection. Replays execute recorded batches without
 starting Julia. `--train`, `--reset-train`, `--league-train`, and
 `--league-evaluate` retain synchronous decisions and terminal reward delivery.
+The synchronous engine adapter waits for socket readiness instead of sleeping
+between successful protocol stages; reconnect and terminal-delivery deadlines
+remain bounded. This does not enable asynchronous decisions during training.
 For a command-line network lobby with two humans and one AI, pass `ai=1`
 alongside `numplayers=2` in the server's `-G` options.
 
@@ -120,10 +135,19 @@ background PPO updates.
 
 ## Headless training
 
-The rollout coordinator runs repeatable headless matches. It trains one mutable
-policy seat, samples frozen opponents from a bounded snapshot league, and
-randomizes map, seat, and seed schedules. Training must use `--workers 1`,
-because its checkpoint and league are shared mutable state.
+The rollout coordinator runs repeatable unattended benchmark matches. It still
+initializes SDL; this is not a renderer-free headless engine. Offline rollouts
+use the engine's fast-forward display/event throttling after simulation starts,
+without changing game type, diplomacy, random seeds, or simulation steps.
+
+Each match trains one mutable policy seat and samples frozen opponents from a
+bounded snapshot league. Map and child-seed schedules are reproducible. Each
+map rotates through its own shuffled computer-seat roster from the `.smp`
+`DefinePlayerTypes` declaration, excluding explicit non-`war1gus-ai` assignments
+in its `.sms` setup. Observer and absent seats are never scheduled. Unsupported
+rosters and maps without eligible computer seats fail before checkpoint reset.
+Training must use `--workers 1`, because its checkpoint and league are shared
+mutable state.
 
 The coordinator also refreshes those files in `--data-dir` before validating
 selected maps or resetting a checkpoint. Direct training and evaluation runs
