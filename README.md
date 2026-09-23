@@ -24,6 +24,13 @@ trees, researched auto-targeted and position-targeted spell use, entity-targeted
 exploration, repair, formations, and defence. Stratagus validates the selected
 commands as one bounded batch before execution; Julia never emits Lua source.
 
+Runtime evaluation batches the entity and candidate encoders into reusable
+per-player CPU buffers and projects the shared context once per request. PPO
+differentiation retains the Flux forward path with the same Float32 weights and
+feature encodings; checkpoints require no migration. Batched arithmetic can
+differ from scalar evaluation by Float32 rounding. TCP frames are bulk-decoded,
+and each selected index is sent in one four-byte write with `TCP_NODELAY`.
+
 Normal games use deterministic inference from the saved policy. Training uses
 stochastic on-policy PPO with a value head: rewarded trajectories improve the
 policy that generated them. A single background worker trains each PPO batch on
@@ -104,6 +111,12 @@ for example:
 ```sh
 JULIA_NUM_THREADS=4 "$AI_ROOT/build/bin/War1gusAI" --train
 ```
+
+The packaged launcher and `run.sh` also default `OPENBLAS_NUM_THREADS=1` when
+unset. The policy's small matrix operations otherwise incur unnecessary BLAS
+thread-pool overhead. Set `OPENBLAS_NUM_THREADS` explicitly to override this
+default; it is independent of the Julia threads used for request handling and
+background PPO updates.
 
 ## Headless training
 

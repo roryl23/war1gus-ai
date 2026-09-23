@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "421af7166ff3eb6a8571fc574f2e0666c8a914da"
+project_hash = "b0315bf47e0dcb1fd782e2b2d59e320de981f2b3"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -861,7 +861,7 @@ weakdeps = ["LLVM"]
     UnsafeAtomicsLLVM = ["LLVM"]
 
 [[deps.War1gusAI]]
-deps = ["Flux", "PackageCompiler", "Random", "Serialization", "Sockets", "Statistics"]
+deps = ["Flux", "LinearAlgebra", "PackageCompiler", "Random", "Serialization", "Sockets", "Statistics"]
 path = "."
 uuid = "dca48339-1bd8-452b-812d-a5a835df2e0c"
 version = "0.1.0"

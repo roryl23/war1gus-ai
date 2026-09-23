@@ -46,6 +46,48 @@ model_state_snapshot(policy) = deepcopy(Flux.state(policy))
   @test_throws ArgumentError War1gusAI.parse_state(v3_state(candidates=Vector{UInt32}[]))
 end
 
+@testset "reused inference storage preserves catalogs and current weights" begin
+  policy = War1gusAI.create_policy(seed=29)
+  workspace = War1gusAI.InferenceWorkspace()
+  entities = [v3_entity(slot=index, relation=index % 3 + 1, hp=index * 7) for index in 1:48]
+  candidates = Vector{UInt32}[v3_candidate()]
+  append!(candidates, [
+    v3_candidate(
+      kind=index % 12 + 1, actor=index % 49, target=(index * 7) % 49,
+      x=index % 128, bootstrap=index - 256,
+    ) for index in 1:511
+  ])
+  large = War1gusAI.parse_state(v3_state(; entities, candidates))
+  small = War1gusAI.parse_state(v3_state(candidates=[
+    v3_candidate(), v3_candidate(kind=6, actor=1, target=1, bootstrap=100),
+  ]))
+  empty = War1gusAI.parse_state(v3_state(
+    entities=Vector{UInt32}[], candidates=[v3_candidate(), v3_candidate()],
+  ))
+  # Grow, shrink, clear entity references, then grow again without stale columns.
+  for observation in (large, small, empty, large)
+    expected_scores, expected_value = War1gusAI._policy_forward(policy, observation)
+    scores, value = War1gusAI._inference_forward!(workspace, policy, observation)
+    @test scores ≈ expected_scores atol = 2f-5 rtol = 2f-5
+    @test value ≈ expected_value atol = 2f-5 rtol = 2f-5
+    @test argmax(scores) == argmax(expected_scores)
+  end
+  @test War1gusAI.select_action(policy, empty) == 0
+  tied = War1gusAI.parse_state(v3_state(
+    entities=Vector{UInt32}[], candidates=[v3_candidate() for _ in 1:511],
+  ))
+  @test War1gusAI.select_action(policy, tied) == 0
+
+  # PPO publication and frozen opponents must use their current weights.
+  replacement = War1gusAI.create_policy(seed=41)
+  for active_policy in (replacement, policy)
+    expected_scores, expected_value = War1gusAI._policy_forward(active_policy, small)
+    scores, value = War1gusAI._inference_forward!(workspace, active_policy, small)
+    @test scores ≈ expected_scores atol = 2f-5 rtol = 2f-5
+    @test value ≈ expected_value atol = 2f-5 rtol = 2f-5
+  end
+end
+
 @testset "GAE targets and normalized trajectory PPO" begin
   state = v3_state(candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=7, actor=1)])
   observation = War1gusAI.parse_state(state)

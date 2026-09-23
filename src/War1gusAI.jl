@@ -32,13 +32,11 @@ end
 function read_exact(io::IO, count::Integer)::Union{Vector{UInt8},Nothing}
  count >= 0 || throw(ArgumentError("cannot read a negative byte count"))
  bytes = Vector{UInt8}(undef, count)
- for index in eachindex(bytes)
-  try
-   bytes[index] = read(io, UInt8)
-  catch error
-   error isa EOFError && return nothing
-   rethrow()
-  end
+ try
+  read!(io, bytes)
+ catch error
+  error isa EOFError && return nothing
+  rethrow()
  end
  return bytes
 end
@@ -50,20 +48,22 @@ end
         UInt32(bytes[offset+3])
 end
 
-function _decode_words(bytes::AbstractVector{UInt8})::Vector{UInt32}
- length(bytes) % 4 == 0 || throw(ArgumentError("AI frame word payload is not u32 aligned"))
- words = Vector{UInt32}(undef, div(length(bytes), 4))
- for index in eachindex(words)
-  words[index] = decode_u32_be(bytes, 4 * (index - 1) + 1)
+function _read_words!(io::IO, words::Vector{UInt32}, first::Int, count::Int)::Bool
+ count == 0 && return true
+ try
+  GC.@preserve words unsafe_read(io, Ptr{UInt8}(pointer(words, first)), UInt(4 * count))
+ catch error
+  error isa EOFError && return false
+  rethrow()
  end
- return words
+ for index in first:first+count-1
+  words[index] = ntoh(words[index])
+ end
+ return true
 end
 
 function write_u32_be(io::IO, value::UInt32)::Nothing
- write(io, UInt8((value >> 24) & 0xff))
- write(io, UInt8((value >> 16) & 0xff))
- write(io, UInt8((value >> 8) & 0xff))
- write(io, UInt8(value & 0xff))
+ write(io, hton(value))
  return nothing
 end
 
@@ -86,34 +86,34 @@ function decode_step_frame(io::IO, prefix::UInt8)::Union{StepFrame,Nothing}
  word_count <= MAX_STATE_WORDS ||
   throw(ArgumentError("AI frame word count $word_count exceeds the protocol cap of $MAX_STATE_WORDS"))
 
- header_bytes = read_exact(io, 4 * STATE_HEADER_WORDS)
- isnothing(header_bytes) && return nothing
- header = _decode_words(header_bytes)
- UInt32(header[1]) == STATE_VERSION ||
-  throw(ArgumentError("unsupported AI state protocol version $(header[1])"))
- entity_count = Int(header[11])
- state_candidate_count = Int(header[12])
+ state = Vector{UInt32}(undef, STATE_HEADER_WORDS)
+ _read_words!(io, state, 1, STATE_HEADER_WORDS) || return nothing
+ state[1] == STATE_VERSION ||
+  throw(ArgumentError("unsupported AI state protocol version $(state[1])"))
+ entity_count = Int(state[11])
+ state_candidate_count = Int(state[12])
  entity_count <= MAX_ENTITY_COUNT ||
   throw(ArgumentError("AI state has $entity_count entities, exceeding the defensive cap of $MAX_ENTITY_COUNT"))
  state_candidate_count <= MAX_CANDIDATES ||
   throw(ArgumentError("AI state has $state_candidate_count candidates, exceeding the defensive cap of $MAX_CANDIDATES"))
+ frame_candidate_count == state_candidate_count ||
+  throw(ArgumentError("AI frame candidate count $frame_candidate_count disagrees with state candidate count $state_candidate_count"))
  expected_words = STATE_HEADER_WORDS + ENTITY_WORDS * entity_count + CANDIDATE_WORDS * state_candidate_count
  expected_words <= MAX_STATE_WORDS ||
   throw(ArgumentError("AI frame requires $expected_words words, exceeding the protocol cap of $MAX_STATE_WORDS"))
  word_count == expected_words ||
   throw(ArgumentError("AI frame declares $word_count words, but its header requires $expected_words"))
 
- tail_bytes = read_exact(io, 4 * (word_count - STATE_HEADER_WORDS))
- isnothing(tail_bytes) && return nothing
- state = vcat(header, _decode_words(tail_bytes))
+ resize!(state, word_count)
+ _read_words!(io, state, STATE_HEADER_WORDS + 1, word_count - STATE_HEADER_WORDS) || return nothing
  terminal = prefix == END_PREFIX
  validate_state(state; terminal, frame_candidate_count)
  return StepFrame(sequence, reward, state, frame_candidate_count)
 end
 
 function _candidate_kind_for_log(frame::StepFrame, action::Int)::String
- observation = parse_state(frame.state)
- return candidate_name(candidate_kind(observation.candidates[action+1]))
+ first_candidate = STATE_HEADER_WORDS + ENTITY_WORDS * state_entity_count(frame.state) + 1
+ return candidate_name(Int(frame.state[first_candidate+action*CANDIDATE_WORDS]))
 end
 
 function handle_client(
@@ -124,6 +124,7 @@ function handle_client(
  completed_players::Set{UInt32}=Set{UInt32}(),
 )::Nothing
  try
+  Sockets.nagle(socket, false)
   init = read_exact(socket, 2)
   isnothing(init) && return nothing
   validate_init_frame(init)
@@ -155,7 +156,7 @@ function handle_client(
       reward_components=reward_components(frame.state),
      )
     end
-    action = process_step!(trainer, session, frame.sequence, frame.reward, frame.state)
+    action = process_step!(trainer, session, frame.sequence, frame.reward, frame.state; validated_state=true)
     0 <= action < frame.candidate_count ||
      throw(ArgumentError("policy returned candidate index $action outside 0:$(frame.candidate_count-1)"))
     write_u32_be(socket, UInt32(action))
@@ -184,7 +185,7 @@ function handle_client(
       reward_components=reward_components(frame.state),
      )
     end
-    finalized = process_terminal!(trainer, session, frame.sequence, frame.reward, frame.state)
+    finalized = process_terminal!(trainer, session, frame.sequence, frame.reward, frame.state; validated_state=true)
     lock(sessions_lock) do
      finalized && push!(completed_players, player)
     end

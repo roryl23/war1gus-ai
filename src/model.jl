@@ -1,4 +1,5 @@
 using Flux
+using LinearAlgebra
 using Random
 using Serialization
 using Statistics
@@ -152,34 +153,48 @@ function validate_state(
  return nothing
 end
 
-"""Parse an already validated v3 state into header, entity, and candidate records."""
-function parse_state(state::AbstractVector{<:Integer}; terminal::Bool=false)::StateObservation
- validate_state(state; terminal)
- words = UInt32.(state)
- header = ntuple(index -> words[index], STATE_HEADER_WORDS)
+# A separate call keeps the record offset immutable in the ntuple closure. Capturing
+# parse_state's incremented offset would box it once per record.
+@inline function _record_words(
+ state::AbstractVector{<:Integer},
+ offset::Int,
+ ::Val{N},
+)::NTuple{N,UInt32} where N
+ return ntuple(field -> UInt32(@inbounds state[offset+field-1]), Val(N))
+end
+
+"""Parse a complete v3 state into header, entity, and candidate records."""
+function parse_state(
+ state::AbstractVector{<:Integer};
+ terminal::Bool=false,
+ validated::Bool=false,
+)::StateObservation
+ Base.require_one_based_indexing(state)
+ validated || validate_state(state; terminal)
+ header = _record_words(state, 1, Val(STATE_HEADER_WORDS))
  entity_count = Int(header[11])
  candidate_count = Int(header[12])
  entities = Vector{EntityObservation}(undef, entity_count)
  offset = STATE_HEADER_WORDS + 1
  for index in eachindex(entities)
-  entities[index] = EntityObservation(ntuple(field -> words[offset+field-1], ENTITY_WORDS))
+  entities[index] = EntityObservation(_record_words(state, offset, Val(ENTITY_WORDS)))
   offset += ENTITY_WORDS
  end
  candidates = Vector{CandidateObservation}(undef, candidate_count)
  for index in eachindex(candidates)
-  candidates[index] = CandidateObservation(ntuple(field -> words[offset+field-1], CANDIDATE_WORDS))
+  candidates[index] = CandidateObservation(_record_words(state, offset, Val(CANDIDATE_WORDS)))
   offset += CANDIDATE_WORDS
  end
  return StateObservation(header, entities, candidates)
 end
 
 """Variable candidate-scoring policy with entity-aware context and a scalar value head."""
-struct AiPolicy
- header_encoder
- entity_encoder
- candidate_encoder
- score_head
- value_head
+struct AiPolicy{H<:Dense,E<:Dense,C<:Dense,S<:Chain,V<:Chain}
+ header_encoder::H
+ entity_encoder::E
+ candidate_encoder::C
+ score_head::S
+ value_head::V
 end
 
 Flux.@layer AiPolicy
@@ -199,35 +214,211 @@ end
 @inline _bounded(value::Real, scale::Real) = clamp(Float32(value) / Float32(scale), -4.0f0, 4.0f0)
 @inline _hashed_feature(word::UInt32) = Float32(word % UInt32(65_537)) / 65_537.0f0
 
-function encode_header(header::NTuple{STATE_HEADER_WORDS,UInt32})::Vector{Float32}
- return Float32[
+@inline function _header_features(header::NTuple{STATE_HEADER_WORDS,UInt32})
+ return (
   _bounded(header[1], 3), _bounded(header[2], 8), _bounded(header[3], 8), _bounded(header[4], 300),
   _bounded(header[5], 20_000), _bounded(header[6], 20_000), _bounded(header[7], 200), _bounded(header[8], 200),
   _bounded(header[9], 256), _bounded(header[10], 256), _bounded(header[11], 256), _bounded(header[12], MAX_CANDIDATES),
   _bounded(header[13], 50_000), _bounded(header[14], 50_000), _bounded(header[15], 50_000), _bounded(header[16], 50_000),
   _bounded(header[17], 1_000), _bounded(header[18], 1_000), _bounded(_signed_word(header[19]), 1_000),
   _bounded(_signed_word(header[20]), 1_000), _bounded(_signed_word(header[21]), 100), _bounded(_signed_word(header[22]), 1_000),
- ]
+ )
 end
 
-function encode_entity(entity::EntityObservation)::Vector{Float32}
+encode_header(header::NTuple{STATE_HEADER_WORDS,UInt32})::Vector{Float32} =
+ collect(_header_features(header))
+
+@inline function _entity_features(entity::EntityObservation)
  words = entity.words
- return Float32[
+ return (
   _bounded(words[1], MAX_ENTITY_COUNT), _hashed_feature(words[2]), _bounded(words[3], 4), _bounded(words[4], 16),
   _bounded(words[5], 256), _bounded(words[6], 256), _bounded(words[7], 1_000), _bounded(words[8], 1_000),
   _bounded(words[9], 20_000), _bounded(words[10], 20_000), _hashed_feature(words[11]), _bounded(words[12], 8),
   _bounded(words[13], 32), _bounded(words[14], 32),
- ]
+ )
 end
 
-function encode_candidate(candidate::CandidateObservation)::Vector{Float32}
+encode_entity(entity::EntityObservation)::Vector{Float32} = collect(_entity_features(entity))
+
+@inline function _candidate_features(candidate::CandidateObservation)
  words = candidate.words
- return Float32[
+ return (
   _bounded(words[1], CANDIDATE_KIND_COUNT), _bounded(words[2], MAX_ENTITY_COUNT), _bounded(words[3], MAX_ENTITY_COUNT),
   _hashed_feature(words[4]), _bounded(words[5], 256), _bounded(words[6], 256), _bounded(words[7], 128),
   _bounded(words[8], 32), _bounded(words[9], 300), _bounded(words[10], 512), _bounded(words[11], 32),
   _bounded(_signed_word(words[12]), 1_000),
- ]
+ )
+end
+
+encode_candidate(candidate::CandidateObservation)::Vector{Float32} = collect(_candidate_features(candidate))
+
+# The workspace owns all batch storage. It is not part of Flux.@layer (or any checkpoint),
+# and a session never shares it with another session or the PPO worker.
+mutable struct InferenceWorkspace
+ header_input::Vector{Float32}
+ header_embedding::Vector{Float32}
+ entity_input::Matrix{Float32}
+ entity_embedding::Matrix{Float32}
+ entity_context::Vector{Float32}
+ global_context::Vector{Float32}
+ candidate_input::Matrix{Float32}
+ candidate_embedding::Matrix{Float32}
+ score_input::Matrix{Float32}
+ score_base::Vector{Float32}
+ hidden::Matrix{Float32}
+ scores::Vector{Float32}
+ value_input::Vector{Float32}
+ value_hidden::Vector{Float32}
+end
+
+InferenceWorkspace() = InferenceWorkspace(
+ Vector{Float32}(undef, STATE_HEADER_WORDS), Vector{Float32}(undef, EMBED_DIM),
+ Matrix{Float32}(undef, ENTITY_WORDS, 0), Matrix{Float32}(undef, EMBED_DIM, 0),
+ zeros(Float32, EMBED_DIM), Vector{Float32}(undef, EMBED_DIM),
+ Matrix{Float32}(undef, CANDIDATE_WORDS, 0), Matrix{Float32}(undef, EMBED_DIM, 0),
+ Matrix{Float32}(undef, 3 * EMBED_DIM, 0), Vector{Float32}(undef, HIDDEN_DIM),
+ Matrix{Float32}(undef, HIDDEN_DIM, 0),
+ Float32[], Vector{Float32}(undef, 2 * EMBED_DIM), Vector{Float32}(undef, HIDDEN_DIM),
+)
+
+function _size_workspace!(workspace::InferenceWorkspace, entity_count::Int, candidate_count::Int)
+ if entity_count > size(workspace.entity_input, 2)
+  capacity = max(entity_count, max(16, 2 * size(workspace.entity_input, 2)))
+  workspace.entity_input = Matrix{Float32}(undef, ENTITY_WORDS, capacity)
+  workspace.entity_embedding = Matrix{Float32}(undef, EMBED_DIM, capacity)
+ end
+ if candidate_count > size(workspace.candidate_input, 2)
+  capacity = max(candidate_count, max(16, 2 * size(workspace.candidate_input, 2)))
+  workspace.candidate_input = Matrix{Float32}(undef, CANDIDATE_WORDS, capacity)
+  workspace.candidate_embedding = Matrix{Float32}(undef, EMBED_DIM, capacity)
+  workspace.score_input = Matrix{Float32}(undef, 3 * EMBED_DIM, capacity)
+  workspace.hidden = Matrix{Float32}(undef, HIDDEN_DIM, capacity)
+  resize!(workspace.scores, capacity)
+ end
+ return nothing
+end
+
+@inline function _feature_column!(matrix::Matrix{Float32}, column::Int, features::NTuple{N,Float32}) where N
+ @inbounds for row in 1:N
+  matrix[row, column] = features[row]
+ end
+ return nothing
+end
+
+function _activate_columns!(output::AbstractMatrix{Float32}, layer::Dense, columns::Int)
+ activation = Flux.NNlib.fast_act(layer.σ, output)
+ @inbounds for column in 1:columns, row in axes(output, 1)
+  output[row, column] = activation(output[row, column] + layer.bias[row])
+ end
+ return nothing
+end
+
+"""Evaluate the unchanged Flux weights without allocating a Dense result for each record."""
+function _inference_forward!(
+ workspace::InferenceWorkspace,
+ policy::AiPolicy,
+ observation::StateObservation,
+)
+ entity_count = length(observation.entities)
+ candidate_count = length(observation.candidates)
+ candidate_count > 0 || throw(ArgumentError("terminal states have no selectable candidates"))
+ _size_workspace!(workspace, entity_count, candidate_count)
+
+ header_features = _header_features(observation.header)
+ @inbounds for row in 1:STATE_HEADER_WORDS
+  workspace.header_input[row] = header_features[row]
+ end
+ header_layer = policy.header_encoder
+ mul!(workspace.header_embedding, header_layer.weight, workspace.header_input)
+ header_activation = Flux.NNlib.fast_act(header_layer.σ, workspace.header_embedding)
+ @inbounds for row in 1:EMBED_DIM
+  workspace.header_embedding[row] = header_activation(workspace.header_embedding[row] + header_layer.bias[row])
+ end
+
+ fill!(workspace.entity_context, 0.0f0)
+ if entity_count > 0
+  for (column, entity) in enumerate(observation.entities)
+   _feature_column!(workspace.entity_input, column, _entity_features(entity))
+  end
+  @views mul!(
+   workspace.entity_embedding[:, 1:entity_count],
+   policy.entity_encoder.weight,
+   workspace.entity_input[:, 1:entity_count],
+  )
+  _activate_columns!(workspace.entity_embedding, policy.entity_encoder, entity_count)
+  @inbounds for column in 1:entity_count, row in 1:EMBED_DIM
+   workspace.entity_context[row] += workspace.entity_embedding[row, column]
+  end
+  @inbounds for row in 1:EMBED_DIM
+   workspace.entity_context[row] /= Float32(entity_count)
+  end
+ end
+ @inbounds for row in 1:EMBED_DIM
+  workspace.global_context[row] = workspace.header_embedding[row] + workspace.entity_context[row]
+ end
+
+ for (column, candidate) in enumerate(observation.candidates)
+  _feature_column!(workspace.candidate_input, column, _candidate_features(candidate))
+ end
+ @views mul!(
+  workspace.candidate_embedding[:, 1:candidate_count],
+  policy.candidate_encoder.weight,
+  workspace.candidate_input[:, 1:candidate_count],
+ )
+ _activate_columns!(workspace.candidate_embedding, policy.candidate_encoder, candidate_count)
+
+ @inbounds for (column, candidate) in enumerate(observation.candidates)
+  actor = candidate_actor(candidate)
+  target = candidate_target(candidate)
+  for row in 1:EMBED_DIM
+   workspace.score_input[row, column] = workspace.candidate_embedding[row, column]
+   workspace.score_input[EMBED_DIM+row, column] =
+    actor == 0 ? 0.0f0 : workspace.entity_embedding[row, actor]
+   workspace.score_input[2*EMBED_DIM+row, column] =
+    target == 0 ? 0.0f0 : workspace.entity_embedding[row, target]
+  end
+ end
+ score_hidden, score_output = policy.score_head.layers
+ @views mul!(
+  workspace.score_base,
+  score_hidden.weight[:, 1:EMBED_DIM],
+  workspace.global_context,
+ )
+ @views mul!(
+  workspace.hidden[:, 1:candidate_count],
+  score_hidden.weight[:, EMBED_DIM+1:4*EMBED_DIM],
+  workspace.score_input[:, 1:candidate_count],
+ )
+ score_activation = Flux.NNlib.fast_act(score_hidden.σ, workspace.hidden)
+ @inbounds for column in 1:candidate_count, row in 1:HIDDEN_DIM
+  workspace.hidden[row, column] = score_activation(
+   workspace.hidden[row, column] + workspace.score_base[row] + score_hidden.bias[row],
+  )
+ end
+ @inbounds for (column, candidate) in enumerate(observation.candidates)
+  score = 0.0f0
+  for row in 1:HIDDEN_DIM
+   score += score_output.weight[1, row] * workspace.hidden[row, column]
+  end
+  workspace.scores[column] = score + score_output.bias[1] + candidate_bootstrap_score(candidate)
+ end
+
+ @inbounds for row in 1:EMBED_DIM
+  workspace.value_input[row] = workspace.global_context[row]
+  workspace.value_input[EMBED_DIM+row] = workspace.entity_context[row]
+ end
+ value_hidden, value_output = policy.value_head.layers
+ mul!(workspace.value_hidden, value_hidden.weight, workspace.value_input)
+ value_activation = Flux.NNlib.fast_act(value_hidden.σ, workspace.value_hidden)
+ @inbounds for row in 1:HIDDEN_DIM
+  workspace.value_hidden[row] = value_activation(workspace.value_hidden[row] + value_hidden.bias[row])
+ end
+ value = 0.0f0
+ @inbounds for row in 1:HIDDEN_DIM
+  value += value_output.weight[1, row] * workspace.value_hidden[row]
+ end
+ value += value_output.bias[1]
+ return @view(workspace.scores[1:candidate_count]), value
 end
 
 function _entity_embeddings(policy::AiPolicy, observation::StateObservation)
@@ -357,7 +548,12 @@ function select_action(
  training::Bool=false,
  rng::AbstractRNG=Random.default_rng(),
 )::Int
- return _select_action(candidate_scores(policy, observation); training, rng)
+ scores = if training
+  candidate_scores(policy, observation)
+ else
+  first(_inference_forward!(InferenceWorkspace(), policy, observation))
+ end
+ return _select_action(scores; training, rng)
 end
 
 function select_action(policy::AiPolicy, state::AbstractVector{<:Integer}; kwargs...)::Int
@@ -496,9 +692,12 @@ mutable struct ClientSession
  trainable::Bool
  frozen_policy::Union{Nothing,AiPolicy}
  finalized::Bool
+ workspace::InferenceWorkspace
 end
 
-ClientSession() = ClientSession(nothing, TrajectoryStep[], nothing, nothing, nothing, true, nothing, false)
+ClientSession() = ClientSession(
+ nothing, TrajectoryStep[], nothing, nothing, nothing, true, nothing, false, InferenceWorkspace(),
+)
 
 struct PpoWorkerFailure
  error
@@ -1041,9 +1240,10 @@ function process_step!(
  session::ClientSession,
  sequence::UInt32,
  reward::Int32,
- state::Vector{UInt32},
+ state::Vector{UInt32};
+ validated_state::Bool=false,
 )::Int
- observation = parse_state(state)
+ observation = parse_state(state; validated=validated_state)
  lock(trainer.lock) do
   _rethrow_worker_failure_locked!(trainer)
   session.finalized && throw(ArgumentError("AI session for player $(session.player) is already finalized"))
@@ -1059,7 +1259,7 @@ function process_step!(
   previous = session.previous
   training = _training_session(trainer, session)
   active_policy = session.trainable ? trainer.policy : (session.frozen_policy::AiPolicy)
-  scores, value = _policy_forward(active_policy, observation)
+  scores, value = _inference_forward!(session.workspace, active_policy, observation)
   if !isnothing(previous)
    if training && previous.collectable &&
       previous.policy_generation == trainer.policy_generation &&
@@ -1102,9 +1302,10 @@ function process_terminal!(
  session::ClientSession,
  sequence::UInt32,
  reward::Int32,
- state::Vector{UInt32},
+ state::Vector{UInt32};
+ validated_state::Bool=false,
 )::Bool
- parse_state(state; terminal=true)
+ parse_state(state; terminal=true, validated=validated_state)
  lock(trainer.lock) do
   _rethrow_worker_failure_locked!(trainer)
   session.finalized && return false

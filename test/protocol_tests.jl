@@ -66,6 +66,9 @@ end
   @test frame.reward == Int32(-100)
   @test frame.state == state
   @test frame.candidate_count == 2
+  output = IOBuffer()
+  War1gusAI.write_u32_be(output, UInt32(0x0102abff))
+  @test take!(output) == UInt8[0x01, 0x02, 0xab, 0xff]
   @test War1gusAI.reward_components(state) == (enemy_progress=90.0f0, own_loss=-20.0f0, time=-1.0f0, terminal_component=0.0f0)
 
   many_candidates = Vector{UInt32}[v3_candidate()]
@@ -95,6 +98,47 @@ end
   @test_throws ArgumentError War1gusAI.parse_state(oversized)
 end
 
+@testset "fragmented and truncated TCP state payloads" begin
+  server = listen(ip"127.0.0.1", 0)
+  port = Int(getsockname(server)[2])
+  state = v3_state(
+    player=0x01020304,
+    entities=Vector{UInt32}[v3_entity(slot=1), v3_entity(slot=2)],
+    candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=7, actor=1, x=300)],
+  )
+  bytes = processor_frame('S', UInt32(0x12345678), Int32(-100), state)[2:end]
+  try
+    for truncated in (false, true)
+      client = connect(ip"127.0.0.1", port)
+      receiver = accept(server)
+      decoding = @async War1gusAI.decode_step_frame(receiver, UInt8('S'))
+      try
+        end_index = truncated ? length(bytes) - 3 : length(bytes)
+        for part in (1:3, 4:17, 18:26, 27:65, 66:end_index)
+          write(client, @view bytes[part])
+          flush(client)
+          yield()
+        end
+        if truncated
+          close(client)
+          @test fetch(decoding) === nothing
+        else
+          frame = fetch(decoding)
+          @test frame.sequence == UInt32(0x12345678)
+          @test frame.reward == Int32(-100)
+          @test frame.state == state
+        end
+      finally
+        isopen(client) && close(client)
+        isopen(receiver) && close(receiver)
+        wait(decoding)
+      end
+    end
+  finally
+    isopen(server) && close(server)
+  end
+end
+
 @testset "v3 server emits a u32 candidate index" begin
   server = listen(ip"127.0.0.1", 0)
   port = Int(getsockname(server)[2])
@@ -120,6 +164,23 @@ end
     flush(client)
     wait(handler)
     @test UInt32(5) in completed
+
+    bad_handler = @async War1gusAI.handle_client(accept(server), trainer, sessions, sessions_lock, completed)
+    bad_client = connect(ip"127.0.0.1", port)
+    try
+      malformed = processor_frame('S', UInt32(0), Int32(0), state; candidate_count=1)
+      write(bad_client, UInt8['I', 3])
+      write(bad_client, @view malformed[1:1+16+4*War1gusAI.STATE_HEADER_WORDS])
+      flush(bad_client)
+      closed_promptly = timedwait(() -> istaskdone(bad_handler), 2) == :ok
+      @test closed_promptly
+      if closed_promptly
+        @test eof(bad_client)
+      end
+    finally
+      isopen(bad_client) && close(bad_client)
+      wait(bad_handler)
+    end
   finally
     isopen(client) && close(client)
     isopen(server) && close(server)
