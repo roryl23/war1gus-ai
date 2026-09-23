@@ -21,8 +21,8 @@ selecting from a fixed action list. The catalog covers waiting, gathering gold
 or wood, bounded legal construction for every race building, roads, and walls,
 every trainable multiplayer unit, the complete base and rebalanced research
 trees, researched auto-targeted and position-targeted spell use, entity-targeted attacks, group movement,
-exploration, repair, formations, and defence. Stratagus validates and executes
-the selected primitive command; Julia never emits Lua source.
+exploration, repair, formations, and defence. Stratagus validates the selected
+commands as one bounded batch before execution; Julia never emits Lua source.
 
 Normal games use deterministic inference from the saved policy. Training uses
 stochastic on-policy PPO with a value head: rewarded trajectories improve the
@@ -75,6 +75,17 @@ installed game-data copy. Set `WAR1GUS_AI_BINARY` to use a different executable.
 The child process starts only when an AI player needs it and closes when the
 game ends. `--train` enables online training; `--reset-train` deliberately
 removes the selected checkpoint and its sibling league before training.
+
+Normal play sends one nonblocking request per AI player while the game keeps
+advancing. A late response is accepted only while its original candidate is
+still legal in the current world; responses older than 499 cycles are discarded.
+Only the multiplayer host runs the Julia policy. It queues each accepted
+decision as an atomic network command batch; clients execute the same batch
+without opening an AI connection. Replays execute recorded batches without
+starting Julia. `--train`, `--reset-train`, `--league-train`, and
+`--league-evaluate` retain synchronous decisions and terminal reward delivery.
+For a command-line network lobby with two humans and one AI, pass `ai=1`
+alongside `numplayers=2` in the server's `-G` options.
 
 ### Julia threads
 
