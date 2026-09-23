@@ -133,12 +133,15 @@ thread-pool overhead. Set `OPENBLAS_NUM_THREADS` explicitly to override this
 default; it is independent of the Julia threads used for request handling and
 background PPO updates.
 
-## Headless training
+## Rollout training
 
-The rollout coordinator runs repeatable unattended benchmark matches. It still
-initializes SDL; this is not a renderer-free headless engine. Offline rollouts
-use the engine's fast-forward display/event throttling after simulation starts,
-without changing game type, diplomacy, random seeds, or simulation steps.
+The rollout coordinator runs repeatable unattended benchmark matches. By
+default, training and evaluation render normally. Add `--fast-forward` to opt
+into the engine's fast-forward display/event throttling after simulation starts:
+this favors simulation throughput at the cost of visible frame rate and input
+responsiveness. It still initializes SDL and is not a renderer-free headless
+engine. Neither mode changes game type, diplomacy, random seeds, or simulation
+steps.
 
 Each match trains one mutable policy seat and samples frozen opponents from a
 bounded snapshot league. Map and child-seed schedules are reproducible. Each
@@ -209,6 +212,12 @@ julia --project="$AI_ROOT" "$AI_ROOT/orchestrate.jl" evaluate \
   --checkpoint "$AI_ROOT/ai-training/checkpoint.jls" \
   --output "$EVALUATION_RUN_DIR/evaluate.jsonl"
 ```
+
+Both examples use normal rendering. To opt in, add `--fast-forward` immediately
+after `train` or `evaluate` in the respective command (for example,
+`orchestrate.jl train --fast-forward` with the remaining arguments unchanged).
+This choice is independent of checkpoint state: an existing training run does
+not need `--reset` to change rendering behavior.
 
 Pass `--league-snapshot PATH` to pin every frozen opponent to one compatible
 snapshot instead of sampling the checkpoint's sibling `league/` directory.

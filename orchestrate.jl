@@ -12,7 +12,7 @@ function parse_options(arguments::Vector{String})
  mode = first(arguments)
  mode in ("train", "evaluate") || throw(ArgumentError("mode must be train or evaluate"))
  values = Dict{Symbol,Any}(
-  :maps => String[], :held_out_maps => String[], :reset => false,
+  :maps => String[], :held_out_maps => String[], :reset => false, :fast_forward => false,
   :checkpoint => nothing, :league_snapshot => nothing,
  )
  option_names = Dict(
@@ -31,9 +31,10 @@ function parse_options(arguments::Vector{String})
    target = argument == "--map" ? :maps : :held_out_maps
    push!(values[target], arguments[index+1])
    index += 2
-  elseif argument == "--reset"
-   get(values, :reset, false) && throw(ArgumentError("--reset may be supplied once"))
-   values[:reset] = true
+  elseif argument == "--reset" || argument == "--fast-forward"
+   key = argument == "--reset" ? :reset : :fast_forward
+   values[key] && throw(ArgumentError("$argument may be supplied once"))
+   values[key] = true
    index += 1
   elseif haskey(option_names, argument)
    index == length(arguments) && throw(ArgumentError("$argument requires a value"))
@@ -81,7 +82,7 @@ function parse_options(arguments::Vector{String})
   timeout_cycles=values[:timeout_cycles], seed=values[:seed], output=values[:output],
   state_root=values[:state_root], checkpoint=values[:checkpoint],
   league_snapshot=values[:league_snapshot], reset=values[:reset],
-  rollout_config=values[:rollout_config])
+  fast_forward=values[:fast_forward], rollout_config=values[:rollout_config])
 end
 
 """Read the selected map's literal player roster; never execute map Lua to discover seats."""
@@ -201,6 +202,7 @@ function build_match_command(options, match)
   "WAR1GUS_ROLLOUT_SEED" => string(match.seed),
   "WAR1GUS_ROLLOUT_TRAIN_PLAYER" => string(match.train_player),
   "WAR1GUS_ROLLOUT_TIMEOUT_CYCLES" => string(options.timeout_cycles),
+  "WAR1GUS_ROLLOUT_FAST_FORWARD" => options.fast_forward ? "1" : "0",
   "WAR1GUS_ROLLOUT_MATCH_ID" => match.match_id,
   "WAR1GUS_ROLLOUT_MODE" => match.mode,
   "WAR1GUS_AI_TRAIN_PLAYER" => string(match.train_player),

@@ -5,6 +5,7 @@ local rollout_map = os.getenv("WAR1GUS_ROLLOUT_MAP")
 local rollout_seed = tonumber(os.getenv("WAR1GUS_ROLLOUT_SEED")) or 0
 local rollout_player = tonumber(os.getenv("WAR1GUS_ROLLOUT_TRAIN_PLAYER")) or 0
 local rollout_timeout = tonumber(os.getenv("WAR1GUS_ROLLOUT_TIMEOUT_CYCLES")) or 1
+local rollout_fast_forward = os.getenv("WAR1GUS_ROLLOUT_FAST_FORWARD") == "1"
 local rollout_match_id = os.getenv("WAR1GUS_ROLLOUT_MATCH_ID") or ""
 local rollout_mode = os.getenv("WAR1GUS_ROLLOUT_MODE") or ""
 
@@ -132,7 +133,7 @@ CustomStartup = function()
     AddTrigger(
       function()
         -- CreateGame resets fast-forward after MapLoaded; enable it here instead.
-        if not fast_forward_enabled then
+        if rollout_fast_forward and not fast_forward_enabled then
           SetFastForwardCycle(rollout_timeout)
           fast_forward_enabled = true
         end

@@ -32,6 +32,9 @@ end
  @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice"]))
  @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice", "--league-snapshot", "/tmp/frozen-opponent"]))
  @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice", "--checkpoint", "/tmp/policy", "--reset"]))
+ for (mode, selection) in (("train", ["--map", "goldrush"]), ("evaluate", ["--held-out-map", "ice", "--checkpoint", "/tmp/policy"]))
+  @test_throws ArgumentError parse_options(orchestration_args(mode; extras=[selection; "--fast-forward"; "--fast-forward"]))
+ end
 end
 
 @testset "schedules use each selected map's trainable computer roster" begin
@@ -282,6 +285,15 @@ end
   @test evaluation_environment["WAR1GUS_AI_CHECKPOINT"] == "/tmp/frozen-policy"
   @test evaluation_environment["WAR1GUS_AI_SNAPSHOT"] == "/tmp/frozen-snapshot"
   @test evaluation_environment["WAR1GUS_AI_LEAGUE_DIR"] == "/tmp/league"
+  withenv("WAR1GUS_ROLLOUT_FAST_FORWARD" => "1") do
+   @test child_environment(default_first_environment)["WAR1GUS_ROLLOUT_FAST_FORWARD"] == "0"
+   @test child_environment(evaluation_environment)["WAR1GUS_ROLLOUT_FAST_FORWARD"] == "0"
+   for (mode, selection) in (("train", ["--map", map]), ("evaluate", ["--held-out-map", held_out, "--checkpoint", "/tmp/frozen-policy"]))
+    options = parse_options(orchestration_args(mode; data_dir, extras=[selection; "--fast-forward"]))
+    _, overrides, _ = build_match_command(options, first(build_schedule(options)))
+    @test child_environment(overrides)["WAR1GUS_ROLLOUT_FAST_FORWARD"] == "1"
+   end
+  end
  end
 end
 
