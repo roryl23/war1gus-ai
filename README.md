@@ -8,21 +8,24 @@ state remains owned by this submodule.
 ## Architecture
 
 Stratagus starts the compiled application on demand and communicates with it on
-localhost through its `AiProcessor*` TCP API. Protocol v3 carries a
-variable-length observation containing economy totals, reward components, and
-one record for every strategically relevant own, enemy, or resource entity.
-Neutral roads are counted for construction limits but omitted from policy
-observations. Lua supplies the complete catalog of legal choices for that
-decision; a choice includes its actor, optional target entity and map position,
-group/formation metadata, cadence, and production context.
+localhost through its `AiProcessor*` TCP API. Protocol v3 carries economy and
+reward totals plus records for on-map units, buildings, resources, and neutral
+roads. The server selects an owned actor, an order, and then any required target
+entity or exact map coordinates in successive requests. Candidate pages keep
+every actor, target, and coordinate reachable without truncating the catalog
+at 512 choices per request.
 
-The Flux policy scores that producer-supplied catalog directly rather than
-selecting from a fixed action list. The catalog covers waiting, gathering gold
-or wood, bounded legal construction for every race building, roads, and walls,
-every trainable multiplayer unit, the complete base and rebalanced research
-trees, researched auto-targeted and position-targeted spell use, entity-targeted attacks, group movement,
-exploration, repair, formations, and defence. Stratagus validates the selected
-commands as one bounded batch before execution; Julia never emits Lua source.
+The engine derives build, train, upgrade, research, and spell choices from its
+registered producer and caster definitions. Lua also offers movement, combat,
+resource, transport, stop, hold, and cancellation orders to every owned actor;
+it does not mask choices by affordability, dependencies, supply, idle state,
+construction counts, or road placement. Stratagus validates and executes the
+selected order. A rejected publication incurs a bounded training penalty, so
+the policy can learn placement requirements such as building beside a road
+instead of following a scripted road-first rule. Intermediate actor, action,
+and coordinate selections receive zero immediate reward and later PPO credit.
+The engine suppresses native AI decision managers and unsolicited unit orders
+for `war1gus-ai`; pathfinding and execution of explicit orders still run.
 
 Runtime evaluation batches the entity and candidate encoders into reusable
 per-player CPU buffers and projects the shared context once per request. PPO
@@ -31,7 +34,9 @@ batched Flux layers. Fused entity-pooling/reference and categorical-reduction
 derivatives avoid allocating a full-batch gradient for each observation.
 Activations are recomputed after every optimizer update; GAE, clipping,
 optimizer behavior, and the default four full-batch epochs are unchanged.
-Weights and features remain Float32, and checkpoints require no migration.
+Weights and features remain Float32. Existing catalog-v4/reward-v3 checkpoints
+load with a logged contract migration; the next save writes catalog-v5/reward-v4
+metadata without resetting the learned weights or optimizer.
 Batched arithmetic can differ from scalar evaluation by Float32 rounding.
 TCP frames are bulk-decoded, and each selected index is sent in one four-byte
 write with `TCP_NODELAY`.
@@ -102,9 +107,10 @@ The child process starts only when an AI player needs it and closes when the
 game ends. `--train` enables online training; `--reset-train` deliberately
 removes the selected checkpoint and its sibling league before training.
 
-Normal play sends one nonblocking request per AI player while the game keeps
-advancing. A late response is accepted only while its original candidate is
-still legal in the current world; responses older than 499 cycles are discarded.
+Normal play sends one nonblocking request per AI player at a time, advancing
+the staged choice across responses while gameplay continues. A late response
+is accepted only while its actor and target still exist; responses older than
+499 cycles are discarded.
 Only the multiplayer host runs the Julia policy. It queues each accepted
 decision as an atomic network command batch; clients execute the same batch
 without opening an AI connection. Replays execute recorded batches without
@@ -227,7 +233,9 @@ snapshot instead of sampling the checkpoint's sibling `league/` directory.
 Asset value is each non-wall unit or building's gold-plus-wood cost multiplied
 by remaining-health fraction. Enemy asset loss produces positive progress,
 own asset loss and elapsed-time buckets are negative, and victory or defeat
-adds the terminal reward component. Compact logs report errors, server
+adds the terminal reward component. An engine-rejected published order adds
+`-5` to the next actor-stage reward; expired responses do not incur this penalty.
+Compact logs report errors, server
 lifecycle, trainer and league configuration, league assignments and snapshots,
 episode finalization, and PPO worker scheduling/completion information,
 including low-frequency queue and timing fields. Gradient work and periodic

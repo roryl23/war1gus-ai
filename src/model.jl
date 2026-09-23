@@ -10,14 +10,15 @@ const STATE_HEADER_WORDS = 22
 const ENTITY_WORDS = 14
 const CANDIDATE_WORDS = 12
 const MAX_CANDIDATES = 512
-const MAX_STATE_WORDS = 65_536
+const MAX_STATE_WORDS = 1_048_576
 const MAX_ENTITY_COUNT = div(MAX_STATE_WORDS - STATE_HEADER_WORDS, ENTITY_WORDS)
-const CANDIDATE_KIND_COUNT = 13
+const ENTITY_FEATURE_SCALE = div(65_536 - STATE_HEADER_WORDS, ENTITY_WORDS)
+const CANDIDATE_KIND_COUNT = 19
 const EMBED_DIM = 48
 const HIDDEN_DIM = 96
 const CHECKPOINT_VERSION = 4
-const CATALOG_VERSION = 4
-const REWARD_VERSION = 3
+const CATALOG_VERSION = 5
+const REWARD_VERSION = 4
 const POLICY_VERSION = 3
 const PPO_VERSION = 1
 const DEFAULT_RANDOM_SEED = 0x574131
@@ -57,6 +58,12 @@ const CANDIDATE_NAMES = (
  "formation",
  "defend",
  "cast-spell",
+ "actor-choice",
+ "action-choice",
+ "entity-choice",
+ "x-choice",
+ "y-choice",
+ "page-choice",
 )
 
 """Return the stable name for a v3 candidate kind."""
@@ -232,7 +239,7 @@ encode_header(header::NTuple{STATE_HEADER_WORDS,UInt32})::Vector{Float32} =
 @inline function _entity_features(entity::EntityObservation)
  words = entity.words
  return (
-  _bounded(words[1], MAX_ENTITY_COUNT), _hashed_feature(words[2]), _bounded(words[3], 4), _bounded(words[4], 16),
+  _bounded(words[1], ENTITY_FEATURE_SCALE), _hashed_feature(words[2]), _bounded(words[3], 4), _bounded(words[4], 16),
   _bounded(words[5], 256), _bounded(words[6], 256), _bounded(words[7], 1_000), _bounded(words[8], 1_000),
   _bounded(words[9], 20_000), _bounded(words[10], 20_000), _hashed_feature(words[11]), _bounded(words[12], 8),
   _bounded(words[13], 32), _bounded(words[14], 32),
@@ -243,8 +250,10 @@ encode_entity(entity::EntityObservation)::Vector{Float32} = collect(_entity_feat
 
 @inline function _candidate_features(candidate::CandidateObservation)
  words = candidate.words
+ # Keep the original kind scale so migrated catalog-v4 encoder weights see
+ # identical features for kinds 0:12; staged kinds extend that range.
  return (
-  _bounded(words[1], CANDIDATE_KIND_COUNT), _bounded(words[2], MAX_ENTITY_COUNT), _bounded(words[3], MAX_ENTITY_COUNT),
+  _bounded(words[1], 13), _bounded(words[2], ENTITY_FEATURE_SCALE), _bounded(words[3], ENTITY_FEATURE_SCALE),
   _hashed_feature(words[4]), _bounded(words[5], 256), _bounded(words[6], 256), _bounded(words[7], 128),
   _bounded(words[8], 32), _bounded(words[9], 300), _bounded(words[10], 512), _bounded(words[11], 32),
   _bounded(_signed_word(words[12]), 1_000),
@@ -611,6 +620,15 @@ function save_policy_checkpoint!(
  return nothing
 end
 
+function _optimizer_shapes_match(saved, fresh)::Bool
+ typeof(saved) == typeof(fresh) || return false
+ saved isa AbstractArray && return size(saved) == size(fresh)
+ return all(
+  index -> _optimizer_shapes_match(getfield(saved, index), getfield(fresh, index)),
+  1:fieldcount(typeof(saved)),
+ )
+end
+
 function _validate_checkpoint_payload(payload, fresh_optimizer_state)::Nothing
  payload isa NamedTuple || throw(ArgumentError("AI checkpoint has an invalid format"))
  required = (
@@ -626,15 +644,17 @@ function _validate_checkpoint_payload(payload, fresh_optimizer_state)::Nothing
  Int(payload.entity_words) == ENTITY_WORDS || throw(ArgumentError("AI checkpoint entity shape is incompatible"))
  Int(payload.candidate_words) == CANDIDATE_WORDS || throw(ArgumentError("AI checkpoint candidate shape is incompatible"))
  Int(payload.max_candidates) == MAX_CANDIDATES || throw(ArgumentError("AI checkpoint candidate cap is incompatible"))
- Int(payload.catalog_version) == CATALOG_VERSION || throw(ArgumentError("AI checkpoint catalog version is incompatible"))
- Int(payload.reward_version) == REWARD_VERSION || throw(ArgumentError("AI checkpoint reward version is incompatible"))
+ Int(payload.catalog_version) in (4, CATALOG_VERSION) ||
+  throw(ArgumentError("AI checkpoint catalog version $(payload.catalog_version) is incompatible with staged-action catalog version $CATALOG_VERSION; use a compatible checkpoint or explicitly reset the old checkpoint and its league snapshots (--reset-train or train --reset)"))
+ Int(payload.reward_version) in (3, REWARD_VERSION) ||
+  throw(ArgumentError("AI checkpoint reward version $(payload.reward_version) is incompatible with rejection-feedback reward version $REWARD_VERSION; use a compatible checkpoint or explicitly reset the old checkpoint and its league snapshots (--reset-train or train --reset)"))
  Int(payload.policy_version) == POLICY_VERSION || throw(ArgumentError("AI checkpoint policy version is incompatible"))
  Int(payload.ppo_version) == PPO_VERSION || throw(ArgumentError("AI checkpoint PPO version is incompatible"))
  payload.algorithm == PPO_ALGORITHM || throw(ArgumentError("AI checkpoint algorithm is incompatible"))
  payload.update_count isa Integer && payload.update_count >= 0 ||
   throw(ArgumentError("AI checkpoint has an invalid update count"))
- typeof(payload.optimizer_state) == typeof(fresh_optimizer_state) ||
-  throw(ArgumentError("AI checkpoint optimizer state is incompatible"))
+ _optimizer_shapes_match(payload.optimizer_state, fresh_optimizer_state) ||
+  throw(ArgumentError("AI checkpoint optimizer state shape is incompatible"))
  return nothing
 end
 
@@ -646,6 +666,17 @@ function load_policy_checkpoint!(path::AbstractString, policy::AiPolicy, fresh_o
   Flux.loadmodel!(policy, payload.model_state)
  catch error
   throw(ArgumentError("AI checkpoint model parameters are incompatible: $(sprint(showerror, error))"))
+ end
+ if Int(payload.catalog_version) != CATALOG_VERSION || Int(payload.reward_version) != REWARD_VERSION
+  log_event(
+   "checkpoint_contract_migration";
+   from_catalog_version=Int(payload.catalog_version),
+   to_catalog_version=CATALOG_VERSION,
+   from_reward_version=Int(payload.reward_version),
+   to_reward_version=REWARD_VERSION,
+   update_count=Int(payload.update_count),
+   warning="Resuming existing weights and optimizer with staged choices and rejection feedback; the action distribution and reward scale have changed, so further training is needed. The next checkpoint save will write current catalog and reward versions.",
+  )
  end
  return (update_count=Int(payload.update_count), optimizer_state=payload.optimizer_state)
 end

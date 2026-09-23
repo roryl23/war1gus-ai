@@ -161,9 +161,19 @@ end
   observation = War1gusAI.parse_state(state)
   @test length(observation.entities) == 2
   @test length(observation.candidates) == 3
-  @test War1gusAI.candidate_name(10) == "formation"
-  @test War1gusAI.candidate_name(12) == "cast-spell"
-  @test_throws ArgumentError War1gusAI.candidate_name(13)
+  @test [War1gusAI.candidate_name(kind) for kind in 12:18] == [
+    "cast-spell", "actor-choice", "action-choice", "entity-choice",
+    "x-choice", "y-choice", "page-choice",
+  ]
+  @test_throws ArgumentError War1gusAI.candidate_name(19)
+  far_edge = War1gusAI.parse_state(v3_state(candidates=[
+    v3_candidate(), v3_candidate(kind=16, x=1022, y=1022),
+    v3_candidate(kind=16, x=1023, y=1023),
+  ]))
+  near_edge_features = War1gusAI.encode_candidate(far_edge.candidates[2])
+  far_edge_features = War1gusAI.encode_candidate(far_edge.candidates[3])
+  @test near_edge_features[5] < far_edge_features[5] < 4
+  @test near_edge_features[6] < far_edge_features[6] < 4
 
   policy = War1gusAI.create_policy(seed=17)
   scores = War1gusAI.candidate_scores(policy, observation)
@@ -198,7 +208,7 @@ end
   candidates = Vector{UInt32}[v3_candidate()]
   append!(candidates, [
     v3_candidate(
-      kind=index % 12 + 1, actor=index % 49, target=(index * 7) % 49,
+      kind=index % 18 + 1, actor=index % 49, target=(index * 7) % 49,
       x=index % 128, bootstrap=index - 256,
     ) for index in 1:511
   ])
@@ -269,20 +279,25 @@ end
       mode=War1gusAI.MODE_TRAIN,
       checkpoint_path=checkpoint,
       seed=23,
-      batch_size=2,
+      batch_size=6,
       rollout_fragment=16,
       ppo_epochs=2,
       checkpoint_every=1,
     )
-    first = v3_state(player=4, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=1, actor=1, bootstrap=50)])
-    second = v3_state(player=4, cycle=101, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=7, actor=1, x=30, bootstrap=70)])
-    terminal = v3_state(player=4, cycle=102, candidates=Vector{UInt32}[], terminal_reward=1_000)
+    stages = [
+      v3_state(player=4, cycle=100, candidates=[v3_candidate(), v3_candidate(kind=kind, actor=1, target=1, x=30, y=60)])
+      for kind in 13:18
+    ]
+    terminal = v3_state(player=4, cycle=100, candidates=Vector{UInt32}[], terminal_reward=1_000)
     before = model_state_snapshot(learner.policy)
 
     session = War1gusAI.ClientSession()
-    War1gusAI.process_step!(learner, session, UInt32(0), Int32(0), first)
-    War1gusAI.process_step!(learner, session, UInt32(1), Int32(20), second)
-    @test War1gusAI.process_terminal!(learner, session, UInt32(2), Int32(1_000), terminal)
+    for (index, stage) in enumerate(stages)
+      War1gusAI.process_step!(learner, session, UInt32(index - 1), Int32(0), stage)
+    end
+    @test length(session.fragment) == 5
+    @test all(step -> step.reward == 0.0f0, session.fragment)
+    @test War1gusAI.process_terminal!(learner, session, UInt32(6), Int32(1_000), terminal)
     task = learner.worker_task
     @test !isnothing(task)
     War1gusAI.flush_trajectories!(learner)
@@ -294,6 +309,37 @@ end
     payload = open(deserialize, checkpoint)
     @test payload.update_count == 1
     @test payload.model_state == Flux.state(learner.policy)
+    restored = War1gusAI.create_trainer(checkpoint_path=checkpoint, seed=99)
+    @test restored.update_count == learner.update_count
+    @test Flux.state(restored.policy) == Flux.state(learner.policy)
+    legacy = joinpath(directory, "legacy.jls")
+    open(legacy, "w") do io
+      serialize(io, merge(payload, (catalog_version=4, reward_version=3)))
+    end
+    migrated = War1gusAI.create_trainer(checkpoint_path=legacy, seed=99)
+    @test migrated.update_count == learner.update_count
+    @test Flux.state(migrated.policy) == payload.model_state
+    @test typeof(migrated.optimizer_state) == typeof(learner.optimizer_state)
+    War1gusAI.save_policy_checkpoint!(legacy, migrated.policy, migrated.optimizer_state, migrated.update_count)
+    migrated_payload = open(deserialize, legacy)
+    @test (migrated_payload.catalog_version, migrated_payload.reward_version) == (5, 4)
+    @test migrated_payload.model_state == payload.model_state
+    incompatible = joinpath(directory, "incompatible.jls")
+    open(incompatible, "w") do io
+      serialize(io, merge(payload, (catalog_version=3,)))
+    end
+    failure = try
+      War1gusAI.create_trainer(checkpoint_path=incompatible)
+      nothing
+    catch error
+      error
+    end
+    @test failure isa ArgumentError
+    if failure isa ArgumentError
+      @test occursin("catalog version 3", sprint(showerror, failure))
+      @test occursin("version 5", sprint(showerror, failure))
+      @test occursin("--reset-train", sprint(showerror, failure))
+    end
     War1gusAI.flush_trajectories!(learner)
     @test learner.update_count == 1
   end

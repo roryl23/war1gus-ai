@@ -75,7 +75,7 @@ end
   append!(many_candidates, [v3_candidate(kind=7, actor=1, x=index, bootstrap=index) for index in 1:299])
   many = v3_state(entities=Vector{UInt32}[v3_entity()], candidates=many_candidates)
   @test War1gusAI.decode_step_frame(IOBuffer(processor_frame('S', UInt32(1), Int32(0), many)[2:end]), UInt8('S')).candidate_count == 300
-  large_entities = Vector{UInt32}[v3_entity(slot=index) for index in 1:4_100]
+  large_entities = Vector{UInt32}[v3_entity(slot=index) for index in 1:5_000]
   large_state = v3_state(entities=large_entities, candidates=Vector{UInt32}[v3_candidate()])
   @test War1gusAI.decode_step_frame(IOBuffer(processor_frame('S', UInt32(2), Int32(0), large_state)[2:end]), UInt8('S')).candidate_count == 1
 
