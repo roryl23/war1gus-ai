@@ -243,14 +243,26 @@ snapshot instead of sampling the checkpoint's sibling `league/` directory.
 ## Rewards and logs
 
 Asset value is each non-wall unit or building's gold-plus-wood cost multiplied
-by remaining-health fraction. Enemy asset loss produces positive progress,
-own asset loss and elapsed-time buckets are negative, and victory or defeat
+by remaining-health fraction. Enemy asset loss produces positive progress.
+Gathering earns +1 per 100 combined gold and wood gathered, measured from
+cumulative player resource counters relative to the first tracked observation;
+the reward is the difference between successive whole-hundred scores, so
+small gains accumulate without an initial windfall. Counter drops are treated
+as resets, not negative gathering. Each increase in cumulative kills earns +10
+per kill, and each increase in cumulative razings earns +50 per razing; counter
+drops do not earn rewards. These positive event rewards share the existing
+`enemy_progress` reward-component header and log field for protocol
+compatibility, rather than appearing as separate components.
+Own asset loss and elapsed-time buckets remain negative, and victory or defeat
 adds the terminal reward component. An engine-rejected published order adds
 `-5` to the next actor-stage reward; expired responses do not incur this penalty.
-Compact logs report errors, server
-lifecycle, trainer and league configuration, league assignments and snapshots,
-episode finalization, and PPO worker scheduling/completion information,
-including low-frequency queue and timing fields. Gradient work and periodic
+Intermediate selections receive deferred credit, not an immediate reward.
+These shaping rewards do not guarantee that farming resources or combat is
+more profitable than winning.
+Compact logs report errors, server lifecycle, trainer and league configuration,
+league assignments, snapshots, episode finalization, and PPO worker
+scheduling/completion information, including low-frequency queue and timing
+fields. Gradient work and periodic
 checkpoint or league-snapshot file I/O run in that worker rather than on the
 request-response path; gameplay continues with the most recently published
 policy during an update. `WAR1GUS_AI_VERBOSE_LOG=1` also emits high-frequency
