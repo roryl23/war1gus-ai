@@ -234,6 +234,71 @@ end
   @test_throws ArgumentError War1gusAI.parse_state(v3_state(candidates=Vector{UInt32}[]))
 end
 
+@testset "worker order and cargo retain the existing entity feature width" begin
+  function worker_features(; action=1, phase=0, flags=0, sight=4, carried_kind=0, held=0)
+    worker = v3_entity(role=1, relation=0)
+    worker[11] = UInt32(16 * action + flags)
+    worker[12] = UInt32(2 + 16 * carried_kind)
+    worker[13] = UInt32(3 + 256 * held)
+    worker[14] = UInt32(256 * phase + sight)
+    observation = War1gusAI.parse_state(v3_state(entities=[worker]))
+    return War1gusAI.encode_entity(only(observation.entities))
+  end
+
+  idle = worker_features(action=1)
+  move = worker_features(action=5)
+  build = worker_features(action=17)
+  repair = worker_features(action=19)
+  travel = worker_features(action=20, phase=5)
+  gather = worker_features(action=20, phase=60)
+  returning = worker_features(action=20, phase=70)
+  @test length(idle) == War1gusAI.ENTITY_WORDS == 14
+  @test [features[11] for features in (idle, move, build, repair, travel)] ==
+        Float32[1, 5, 17, 19, 20] ./ 32
+  @test idle[11] < move[11] < build[11] < repair[11] < travel[11]
+  @test [features[14] for features in (travel, gather, returning)] ==
+        Float32[5, 60, 70] ./ 128 .+ 4f0 / 32_768
+  @test travel[14] < gather[14] < returning[14]
+  @test worker_features(action=20, phase=59, sight=255)[14] <
+        worker_features(action=20, phase=60, sight=0)[14]
+  @test worker_features(action=19, flags=15)[11] < travel[11]
+  @test worker_features(action=20, flags=15)[11] < worker_features(action=21)[11]
+  @test worker_features(action=20, flags=5)[11] == 20f0 / 32 + 5f0 / 512
+  @test worker_features(action=20, phase=120, sight=255)[14] ==
+        120f0 / 128 + 255f0 / 32_768
+  @test idle[12] == move[12] == gather[12] == 2f0 / 256
+  @test idle[13] == move[13] == gather[13] == 3f0 / 32
+
+  gold = worker_features(action=20, phase=60, carried_kind=1, held=50)
+  wood = worker_features(action=20, phase=60, carried_kind=2, held=50)
+  oil = worker_features(action=20, phase=60, carried_kind=3, held=50)
+  full = worker_features(carried_kind=1, held=600)
+  @test gold[12] < wood[12] < oil[12]
+  @test gold[13] == 3f0 / 32 + 50f0 / 100
+  @test full[13] == 3f0 / 32 + 4f0
+  @test gold[11] == gather[11]
+  @test all(index -> gold[index] == gather[index], 1:10)
+  @test gold[14] == gather[14]
+
+  non_worker = v3_entity(role=3)
+  non_worker[11] = 16 * 20
+  non_worker[13] = 300
+  non_worker[14] = 256 * 60 + 4
+  observation = War1gusAI.parse_state(v3_state(entities=[non_worker]))
+  decoded = War1gusAI.encode_entity(only(observation.entities))
+  @test decoded[11] == Float32((16 * 20) % 65_537) / 65_537f0
+  @test decoded[13] == 4f0
+  @test decoded[14] == 4f0
+
+  enemy_worker = v3_entity(role=1, relation=1)
+  enemy_worker[11] = 9
+  enemy_worker[14] = 4
+  enemy_observation = War1gusAI.parse_state(v3_state(entities=[enemy_worker]))
+  enemy_features = War1gusAI.encode_entity(only(enemy_observation.entities))
+  @test enemy_features[11] == 9f0 / 65_537
+  @test enemy_features[14] == 4f0 / 32
+end
+
 @testset "reused inference storage preserves catalogs and current weights" begin
   policy = War1gusAI.create_policy(seed=29)
   workspace = War1gusAI.InferenceWorkspace()
@@ -249,11 +314,19 @@ end
   small = War1gusAI.parse_state(v3_state(candidates=[
     v3_candidate(), v3_candidate(kind=6, actor=1, target=1, bootstrap=100),
   ]))
+  cargo_worker = v3_entity(relation=0)
+  cargo_worker[11] = 16 * 20
+  cargo_worker[12] = 18
+  cargo_worker[13] = 3 + 256 * 50
+  cargo_worker[14] = 256 * 60 + 4
+  cargo = War1gusAI.parse_state(v3_state(entities=[cargo_worker], candidates=[
+    v3_candidate(), v3_candidate(kind=6, actor=1, target=1),
+  ]))
   empty = War1gusAI.parse_state(v3_state(
     entities=Vector{UInt32}[], candidates=[v3_candidate(), v3_candidate()],
   ))
   # Grow, shrink, clear entity references, then grow again without stale columns.
-  for observation in (large, small, empty, large)
+  for observation in (large, small, cargo, empty, large)
     expected_scores, expected_value = War1gusAI._policy_forward(policy, observation)
     scores, value = War1gusAI._inference_forward!(workspace, policy, observation)
     @test scores ≈ expected_scores atol = 2f-5 rtol = 2f-5
@@ -790,13 +863,21 @@ end
     @test payload.entity_words == 14
     @test payload.candidate_words == 12
     @test payload.algorithm == War1gusAI.PPO_ALGORITHM
-    @test payload.catalog_version == 7
-    for catalog_version in (4, 5, 6)
+    @test payload.catalog_version == War1gusAI.CATALOG_VERSION
+    for catalog_version in (4, 5, 6, 7, 8)
       open(path, "w") do io
         serialize(io, merge(payload, (catalog_version=catalog_version,)))
       end
       restored = War1gusAI.create_trainer(mode=War1gusAI.MODE_INFERENCE, checkpoint_path=path)
       @test restored.update_count == trainer.update_count
+      @test Flux.state(restored.policy) == payload.model_state
+      if catalog_version == 8
+        @test typeof(restored.optimizer_state) == typeof(trainer.optimizer_state)
+        War1gusAI.save_policy_checkpoint!(path, restored.policy, restored.optimizer_state, restored.update_count)
+        migrated = open(deserialize, path)
+        @test migrated.catalog_version == War1gusAI.CATALOG_VERSION
+        @test migrated.model_state == payload.model_state
+      end
     end
 
     open(path, "w") do io

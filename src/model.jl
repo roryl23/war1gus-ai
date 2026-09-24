@@ -17,7 +17,7 @@ const CANDIDATE_KIND_COUNT = 19
 const EMBED_DIM = 48
 const HIDDEN_DIM = 96
 const CHECKPOINT_VERSION = 4
-const CATALOG_VERSION = 7
+const CATALOG_VERSION = 9
 const REWARD_VERSION = 4
 const POLICY_VERSION = 3
 const PPO_VERSION = 1
@@ -239,13 +239,39 @@ end
 encode_header(header::NTuple{STATE_HEADER_WORDS,UInt32})::Vector{Float32} =
  collect(_header_features(header))
 
+@inline function _worker_action_feature(word::UInt32)::Float32
+ return Float32(word >> 4) / 32.0f0 + Float32(word & UInt32(0x0f)) / 512.0f0
+end
+ChainRulesCore.@non_differentiable _worker_action_feature(::UInt32)
+
+@inline function _worker_phase_feature(word::UInt32)::Float32
+ return Float32(word >> 8) / 128.0f0 + Float32(word & UInt32(0xff)) / 32_768.0f0
+end
+ChainRulesCore.@non_differentiable _worker_phase_feature(::UInt32)
+
+@inline function _worker_cargo_feature(word::UInt32)::Float32
+ return _bounded(word >> 4, 16) + Float32(word & UInt32(0x0f)) / 256.0f0
+end
+ChainRulesCore.@non_differentiable _worker_cargo_feature(::UInt32)
+
+@inline function _worker_range_feature(word::UInt32)::Float32
+ return _bounded(word & UInt32(0xff), 32) + _bounded(word >> 8, 100)
+end
+ChainRulesCore.@non_differentiable _worker_range_feature(::UInt32)
+
 @inline function _entity_features(entity::EntityObservation)
  words = entity.words
+ # Owned workers encode exact action, resource phase, and carried amount in existing words.
+ worker = words[4] == 1 && words[3] == 0
+ action_feature = worker ? _worker_action_feature(words[11]) : _hashed_feature(words[11])
+ range_feature = worker ? _worker_range_feature(words[13]) : _bounded(words[13], 32)
+ phase_feature = worker ? _worker_phase_feature(words[14]) : _bounded(words[14], 32)
  return (
   _bounded(words[1], ENTITY_FEATURE_SCALE), _hashed_feature(words[2]), _bounded(words[3], 4), _bounded(words[4], 16),
   _bounded(words[5], 256), _bounded(words[6], 256), _bounded(words[7], 1_000), _bounded(words[8], 1_000),
-  _bounded(words[9], 20_000), _bounded(words[10], 20_000), _hashed_feature(words[11]), _bounded(words[12], 8),
-  _bounded(words[13], 32), _bounded(words[14], 32),
+  _bounded(words[9], 20_000), _bounded(words[10], 20_000), action_feature,
+  worker ? _worker_cargo_feature(words[12]) : _bounded(words[12], 8),
+  range_feature, phase_feature,
  )
 end
 
@@ -677,7 +703,7 @@ function _validate_checkpoint_payload(payload, fresh_optimizer_state)::Nothing
  Int(payload.entity_words) == ENTITY_WORDS || throw(ArgumentError("AI checkpoint entity shape is incompatible"))
  Int(payload.candidate_words) == CANDIDATE_WORDS || throw(ArgumentError("AI checkpoint candidate shape is incompatible"))
  Int(payload.max_candidates) == MAX_CANDIDATES || throw(ArgumentError("AI checkpoint candidate cap is incompatible"))
- Int(payload.catalog_version) in (4, 5, 6, CATALOG_VERSION) ||
+ Int(payload.catalog_version) in (4, 5, 6, 7, 8, CATALOG_VERSION) ||
   throw(ArgumentError("AI checkpoint catalog version $(payload.catalog_version) is incompatible with catalog version $CATALOG_VERSION; use a compatible checkpoint or explicitly reset the old checkpoint and its league snapshots (--reset-train or train --reset)"))
  Int(payload.reward_version) in (3, REWARD_VERSION) ||
   throw(ArgumentError("AI checkpoint reward version $(payload.reward_version) is incompatible with rejection-feedback reward version $REWARD_VERSION; use a compatible checkpoint or explicitly reset the old checkpoint and its league snapshots (--reset-train or train --reset)"))

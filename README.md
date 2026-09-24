@@ -10,10 +10,28 @@ state remains owned by this submodule.
 Stratagus starts the compiled application on demand and communicates with it on
 localhost through its `AiProcessor*` TCP API. Protocol v3 carries economy and
 reward totals plus records for on-map units, buildings, resources, and neutral
-roads. The server selects an owned actor, an order, and then any required target
+roads, plus observation-only owned workers inside resource hosts. The server
+selects an owned actor, an order, and then any required target
 entity or exact map coordinates in successive requests. Candidate pages keep
 every offered actor, target, and coordinate reachable without truncating the
 catalog at 512 choices per request.
+
+For owned workers, the engine exposes `GetUnitVariable(slot, "CurrentAction")`
+as the numeric `UnitAction` ordinal (0–21), and
+`GetUnitVariable(slot, "ResourcePhase")` as the existing resource-order state
+(0–120, or 0 when the current action is not Resource). Lua packs the action
+with the existing low four status flags in entity word 11; the policy reads
+action/32 + flags/512. Word 14 packs exact resource phase above the low eight
+sight-range bits; the policy reads phase/128 + sight/32768, preserving distinct
+phases even at adjacent phase and sight boundaries. For action 20
+(Resource), phase 5 is travel toward a source, 60 is active extraction, and
+70 is return toward a depot, so an active order is not mistaken for gathering
+throughout travel or return. The observation retains carried resource kind
+and amount; the policy decodes the packed cargo ID before bounding it, so
+different carried resources do not collapse into the same feature.
+A resource-order worker inside a mine or depot remains visible as
+an observation-only entity, not a selectable actor or target. These fields
+reuse the 14-word entity record without changing protocol width.
 
 The engine derives build, train, upgrade, research, and spell choices from its
 registered producer and caster definitions. Lua offers movement, combat,
@@ -27,6 +45,8 @@ no hall, its build-site coordinates are limited to sites `AiCanBuildAt` reports
 legal; an accepted locally preferred first-hall order reserves only that builder
 until the hall finishes, the order aborts, or a bounded timeout expires.
 Other actors remain available. Stratagus revalidates every published order.
+Awareness of a worker's activity does not prevent stochastic training choices
+from interrupting its order.
 A rejected publication incurs a bounded training penalty. Intermediate
 selections receive zero immediate reward and later PPO credit.
 The engine suppresses native AI decision managers and unsolicited unit orders
@@ -39,9 +59,10 @@ batched Flux layers. Fused entity-pooling/reference and categorical-reduction
 derivatives avoid allocating a full-batch gradient for each observation.
 Activations are recomputed after every optimizer update; GAE, clipping,
 optimizer behavior, and the default four full-batch epochs are unchanged.
-Weights and features remain Float32. Existing catalog-v4/reward-v3 checkpoints
-load with a logged contract migration; the next save writes catalog-v5/reward-v4
-metadata without resetting the learned weights or optimizer.
+Weights and features remain Float32. Existing catalog-v4 through v8 and
+reward-v3 checkpoints load with a logged contract migration; the next save
+writes catalog-v9/reward-v4 metadata without resetting learned weights or
+optimizer state. The newly exposed worker signals still need training.
 Batched arithmetic can differ from scalar evaluation by Float32 rounding.
 TCP frames are bulk-decoded, and each selected index is sent in one four-byte
 write with `TCP_NODELAY`.
