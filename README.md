@@ -16,16 +16,19 @@ every offered actor, target, and coordinate reachable without truncating the
 catalog at 512 choices per request.
 
 The engine derives build, train, upgrade, research, and spell choices from its
-registered producer and caster definitions. Lua also offers movement, combat,
-resource, transport, stop, hold, and cancellation orders to every owned actor.
+registered producer and caster definitions. Lua offers movement, combat,
+transport, stop, hold, and cancellation orders to every owned actor. Harvesting
+choices are restricted to peasants and peons: `resource-location` targets forest
+tiles containing trees, while `resource` targets live gold mine entities. Other
+position actions retain normal map coordinates.
 Except for the first town hall, choices are not masked by affordability,
 dependencies, supply, idle state, construction counts, or road placement. With
 no hall, its build-site coordinates are limited to sites `AiCanBuildAt` reports
 legal; an accepted locally preferred first-hall order reserves only that builder
 until the hall finishes, the order aborts, or a bounded timeout expires.
-Other actors remain available. Stratagus validates every published order. A rejected publication
-incurs a bounded training penalty. Intermediate selections receive zero
-immediate reward and later PPO credit.
+Other actors remain available. Stratagus revalidates every published order.
+A rejected publication incurs a bounded training penalty. Intermediate
+selections receive zero immediate reward and later PPO credit.
 The engine suppresses native AI decision managers and unsolicited unit orders
 for `war1gus-ai`; pathfinding and execution of explicit orders still run.
 
