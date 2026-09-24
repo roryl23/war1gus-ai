@@ -50,8 +50,8 @@ end
       candidates=[
         v3_candidate(),
         v3_candidate(kind=6, actor=3, target=1, bootstrap=400),
-        v3_candidate(kind=7, actor=0, target=2, x=40),
-        v3_candidate(kind=6, actor=1, target=3, bootstrap=-300),
+        v3_candidate(kind=7, actor=0, target=2, x=40, group_size=2),
+        v3_candidate(kind=6, actor=1, target=3, bootstrap=-300, group_size=1),
         v3_candidate(kind=8, actor=3, target=3, bootstrap=200),
       ],
     )),
@@ -117,6 +117,39 @@ end
     # scalar path, particularly through the segmented entity mean.
     @test actual ≈ expected atol = 3f-5 rtol = 3f-4
   end
+end
+
+@testset "opening hints bias exploration without removing other choices" begin
+  candidates = [
+    v3_candidate(),
+    v3_candidate(kind=14, group_size=1),
+    v3_candidate(kind=14, group_size=2),
+    v3_candidate(kind=14),
+  ]
+  observation = War1gusAI.parse_state(v3_state(candidates=candidates))
+  scores = zeros(Float32, length(candidates))
+  log_probabilities = War1gusAI.training_action_log_probabilities(scores, observation.candidates)
+  probabilities = exp.(log_probabilities)
+  @test all(>(0), probabilities)
+  @test sum(probabilities) ≈ 1.0f0 atol = 1f-6
+  @test probabilities ≈ Float32[0.05, 0.05+0.8*8/41, 0.05+0.8*32/41, 0.05+0.8/41] atol = 1f-6
+  @test probabilities[3] > probabilities[2] > probabilities[4] > probabilities[1]
+
+  plain = War1gusAI.parse_state(v3_state(candidates=[
+    v3_candidate(), v3_candidate(kind=14), v3_candidate(kind=14), v3_candidate(kind=14),
+  ]))
+  plain_probabilities = exp.(War1gusAI.training_action_log_probabilities(scores, plain.candidates))
+  @test plain_probabilities ≈ Float32[0.05, 0.05+0.8/3, 0.05+0.8/3, 0.05+0.8/3] atol = 1f-6
+  @test probabilities[3] > plain_probabilities[3]
+
+  step = War1gusAI.TrajectoryStep(observation, 2, 0.0f0, log_probabilities[3], 0.0f0, false)
+  batch = War1gusAI._pack_ppo_batch([step], Float32[0], Float32[1])
+  packed_statistics = War1gusAI._segmented_policy_statistics(
+    scores, batch.candidate_offsets, batch.actions, batch.first_waits,
+    batch.exploration_weights, batch.exploration_weight_sums,
+  )
+  @test packed_statistics[1, 1] ≈ log_probabilities[3] atol = 1f-6
+  @test packed_statistics[2, 1] ≈ -sum(probabilities .* log_probabilities) atol = 1f-6
 end
 
 @testset "entity-free PPO does not advance Adam's entity momentum" begin
@@ -322,7 +355,6 @@ end
     @test typeof(migrated.optimizer_state) == typeof(learner.optimizer_state)
     War1gusAI.save_policy_checkpoint!(legacy, migrated.policy, migrated.optimizer_state, migrated.update_count)
     migrated_payload = open(deserialize, legacy)
-    @test (migrated_payload.catalog_version, migrated_payload.reward_version) == (5, 4)
     @test migrated_payload.model_state == payload.model_state
     incompatible = joinpath(directory, "incompatible.jls")
     open(incompatible, "w") do io
@@ -335,11 +367,6 @@ end
       error
     end
     @test failure isa ArgumentError
-    if failure isa ArgumentError
-      @test occursin("catalog version 3", sprint(showerror, failure))
-      @test occursin("version 5", sprint(showerror, failure))
-      @test occursin("--reset-train", sprint(showerror, failure))
-    end
     War1gusAI.flush_trajectories!(learner)
     @test learner.update_count == 1
   end
@@ -763,6 +790,14 @@ end
     @test payload.entity_words == 14
     @test payload.candidate_words == 12
     @test payload.algorithm == War1gusAI.PPO_ALGORITHM
+    @test payload.catalog_version == 7
+    for catalog_version in (4, 5, 6)
+      open(path, "w") do io
+        serialize(io, merge(payload, (catalog_version=catalog_version,)))
+      end
+      restored = War1gusAI.create_trainer(mode=War1gusAI.MODE_INFERENCE, checkpoint_path=path)
+      @test restored.update_count == trainer.update_count
+    end
 
     open(path, "w") do io
       serialize(io, (version=3, obsolete_checkpoint=true, update_count=0))

@@ -12,18 +12,20 @@ localhost through its `AiProcessor*` TCP API. Protocol v3 carries economy and
 reward totals plus records for on-map units, buildings, resources, and neutral
 roads. The server selects an owned actor, an order, and then any required target
 entity or exact map coordinates in successive requests. Candidate pages keep
-every actor, target, and coordinate reachable without truncating the catalog
-at 512 choices per request.
+every offered actor, target, and coordinate reachable without truncating the
+catalog at 512 choices per request.
 
 The engine derives build, train, upgrade, research, and spell choices from its
 registered producer and caster definitions. Lua also offers movement, combat,
-resource, transport, stop, hold, and cancellation orders to every owned actor;
-it does not mask choices by affordability, dependencies, supply, idle state,
-construction counts, or road placement. Stratagus validates and executes the
-selected order. A rejected publication incurs a bounded training penalty, so
-the policy can learn placement requirements such as building beside a road
-instead of following a scripted road-first rule. Intermediate actor, action,
-and coordinate selections receive zero immediate reward and later PPO credit.
+resource, transport, stop, hold, and cancellation orders to every owned actor.
+Except for the first town hall, choices are not masked by affordability,
+dependencies, supply, idle state, construction counts, or road placement. With
+no hall, its build-site coordinates are limited to sites `AiCanBuildAt` reports
+legal; an accepted locally preferred first-hall order reserves only that builder
+until the hall finishes, the order aborts, or a bounded timeout expires.
+Other actors remain available. Stratagus validates every published order. A rejected publication
+incurs a bounded training penalty. Intermediate selections receive zero
+immediate reward and later PPO credit.
 The engine suppresses native AI decision managers and unsolicited unit orders
 for `war1gus-ai`; pathfinding and execution of explicit orders still run.
 
@@ -158,10 +160,15 @@ rosters and maps without eligible computer seats fail before checkpoint reset.
 Training must use `--workers 1`, because its checkpoint and league are shared
 mutable state.
 When alternatives exist, training samples each AI seat from a 20% policy and
-80% uniform non-wait mixture. `wait` remains selectable; every non-wait
-candidate retains probability even under a strongly wait-biased checkpoint.
-Only the mutable seat contributes PPO trajectories, whose likelihoods and
-entropy use the same mixture. Inference and league evaluation remain greedy.
+80% non-wait exploration mixture. While no hall exists, workers and first-hall
+actions receive eight times the baseline exploration weight. Legal first-hall
+sites within 12 tiles of a gold mine and no farther from their builder than
+that builder's nearest mine plus eight tiles receive 32 times the baseline
+weight; other legal sites remain selectable. Every other candidate also
+retains nonzero probability, and the preference disappears when a hall
+foundation exists. `wait` remains selectable. Only the mutable seat
+contributes PPO trajectories, whose likelihoods and entropy use the exact
+sampling mixture. Inference and league evaluation remain greedy.
 
 The coordinator also refreshes those files in `--data-dir` before validating
 selected maps or resetting a checkpoint. Direct training and evaluation runs

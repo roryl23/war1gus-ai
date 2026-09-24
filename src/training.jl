@@ -7,6 +7,8 @@ struct PpoBatch
  entity_offsets::Vector{Int}
  candidate_offsets::Vector{Int}
  first_waits::Vector{Bool}
+ exploration_weights::Vector{Float32}
+ exploration_weight_sums::Vector{Float32}
  candidate_states::Vector{Int}
  actors::Vector{Int}
  targets_entity::Vector{Int}
@@ -30,6 +32,8 @@ function _pack_ppo_batch(
  entity_offsets = Vector{Int}(undef, count + 1)
  candidate_offsets = Vector{Int}(undef, count + 1)
  first_waits = Vector{Bool}(undef, count)
+ exploration_weights = Vector{Float32}(undef, total_candidates)
+ exploration_weight_sums = Vector{Float32}(undef, count)
  candidate_states = Vector{Int}(undef, total_candidates)
  actors = Vector{Int}(undef, total_candidates)
  targets_entity = Vector{Int}(undef, total_candidates)
@@ -49,6 +53,9 @@ function _pack_ppo_batch(
    throw(ArgumentError("candidate index $(step.action) is outside the supplied candidate sequence"))
   entity_offsets[index] = next_entity
   first_waits[index] = candidate_kind(first(observation.candidates)) == 0
+  exploration_weight_sums[index] = _training_exploration_weight_sum(
+   observation.candidates, first_waits[index] && length(observation.candidates) > 1,
+  )
   candidate_offsets[index] = next_candidate
   _feature_column!(headers, index, _header_features(observation.header))
   for entity in observation.entities
@@ -57,6 +64,7 @@ function _pack_ppo_batch(
   end
   for candidate in observation.candidates
    _feature_column!(candidates, next_candidate, _candidate_features(candidate))
+   exploration_weights[next_candidate] = _training_exploration_weight(candidate)
    candidate_states[next_candidate] = index
    actor = candidate_actor(candidate)
    target = candidate_target(candidate)
@@ -73,7 +81,8 @@ function _pack_ppo_batch(
  entity_offsets[end] = next_entity
  candidate_offsets[end] = next_candidate
  return PpoBatch(
-  headers, entities, candidates, entity_offsets, candidate_offsets, first_waits, candidate_states,
+  headers, entities, candidates, entity_offsets, candidate_offsets, first_waits,
+  exploration_weights, exploration_weight_sums, candidate_states,
   actors, targets_entity, actions, bootstrap_scores,
   old_log_probabilities, old_values, targets, advantages,
  )
@@ -177,6 +186,7 @@ end
 # The segmented catalog derivative avoids a full-catalog tangent per state.
 function _segmented_policy_statistics_with_cache(
  scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}, first_waits::Vector{Bool},
+ exploration_weights::Vector{Float32}, exploration_weight_sums::Vector{Float32},
 )
  count = length(actions)
  statistics = Matrix{Float32}(undef, 2, count)
@@ -186,14 +196,15 @@ function _segmented_policy_statistics_with_cache(
   first_candidate = offsets[index]
   last_candidate = offsets[index+1] - 1
   skip_wait = first_waits[index] && last_candidate > first_candidate
-  uniform_probability = _training_uniform_probability(last_candidate - first_candidate + 1, skip_wait)
+  weight_sum = exploration_weight_sums[index]
   segment_log_probabilities = Flux.logsoftmax(@view scores[first_candidate:last_candidate])
   entropy = 0.0f0
   for candidate in first_candidate:last_candidate
    local_index = candidate - first_candidate + 1
    policy_log_probability = segment_log_probabilities[local_index]
    log_probability = _training_mixture_log_probability(
-    policy_log_probability, local_index, skip_wait, uniform_probability,
+    policy_log_probability, local_index, skip_wait,
+    TRAIN_EXPLORATION_FRACTION * exploration_weights[candidate] / weight_sum,
    )
    log_probabilities[candidate] = log_probability
    probabilities[candidate] = exp(policy_log_probability)
@@ -207,20 +218,27 @@ end
 
 _segmented_policy_statistics(
  scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}, first_waits::Vector{Bool},
-) = first(_segmented_policy_statistics_with_cache(scores, offsets, actions, first_waits))
+ exploration_weights::Vector{Float32}, exploration_weight_sums::Vector{Float32},
+) = first(_segmented_policy_statistics_with_cache(
+ scores, offsets, actions, first_waits, exploration_weights, exploration_weight_sums,
+))
 
 function ChainRulesCore.rrule(
  ::typeof(_segmented_policy_statistics),
  scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}, first_waits::Vector{Bool},
+ exploration_weights::Vector{Float32}, exploration_weight_sums::Vector{Float32},
 )
  statistics, log_probabilities, probabilities =
-  _segmented_policy_statistics_with_cache(scores, offsets, actions, first_waits)
+  _segmented_policy_statistics_with_cache(
+   scores, offsets, actions, first_waits, exploration_weights, exploration_weight_sums,
+  )
  function segmented_pullback(cotangent)
   cotangent = ChainRulesCore.unthunk(cotangent)
   if cotangent isa ChainRulesCore.AbstractZero
    return (
     ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(),
     ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(),
+    ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(),
    )
   end
   score_gradient = similar(scores)
@@ -251,6 +269,7 @@ function ChainRulesCore.rrule(
   return (
    ChainRulesCore.NoTangent(), score_gradient,
    ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(),
+   ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(),
   )
  end
  return statistics, segmented_pullback
@@ -285,6 +304,7 @@ function _ppo_loss(
  # Flux AD semantics, including min/max/clamp tie behavior.
  statistics = _segmented_policy_statistics(
   scores, batch.candidate_offsets, batch.actions, batch.first_waits,
+  batch.exploration_weights, batch.exploration_weight_sums,
  )
  log_probabilities = @view statistics[1, :]
  entropy = @view statistics[2, :]

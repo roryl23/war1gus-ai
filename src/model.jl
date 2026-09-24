@@ -17,7 +17,7 @@ const CANDIDATE_KIND_COUNT = 19
 const EMBED_DIM = 48
 const HIDDEN_DIM = 96
 const CHECKPOINT_VERSION = 4
-const CATALOG_VERSION = 5
+const CATALOG_VERSION = 7
 const REWARD_VERSION = 4
 const POLICY_VERSION = 3
 const PPO_VERSION = 1
@@ -527,18 +527,25 @@ function candidate_log_probability_and_entropy(
 end
 
 @inline function _training_mixture_log_probability(
- log_probability::Float32, index::Int, skip_wait::Bool, uniform_probability::Float32,
+ log_probability::Float32, index::Int, skip_wait::Bool, exploration_probability::Float32,
 )::Float32
  # The excluded wait still has its policy mass; use log space so even a
  # vanishingly unlikely wait retains a finite log probability.
  if skip_wait && index == 1
   return log_probability + TRAIN_LOG_POLICY_FRACTION
  end
- return log(TRAIN_POLICY_FRACTION * exp(log_probability) + uniform_probability)
+ return log(TRAIN_POLICY_FRACTION * exp(log_probability) + exploration_probability)
 end
 
-@inline function _training_uniform_probability(count::Int, skip_wait::Bool)::Float32
- return TRAIN_EXPLORATION_FRACTION / Float32(count - Int(skip_wait))
+@inline _training_exploration_weight(candidate::CandidateObservation)::Float32 =
+ candidate.words[7] == UInt32(2) ? 32.0f0 : candidate.words[7] == UInt32(1) ? 8.0f0 : 1.0f0
+
+function _training_exploration_weight_sum(candidates::AbstractVector{CandidateObservation}, skip_wait::Bool)::Float32
+ total = 0.0f0
+ for index in (1+Int(skip_wait)):length(candidates)
+  total += _training_exploration_weight(candidates[index])
+ end
+ return total
 end
 
 """Log probabilities of the training policy mixture in original catalog order."""
@@ -549,10 +556,13 @@ function training_action_log_probabilities(
  count > 0 || throw(ArgumentError("cannot sample an empty candidate sequence"))
  length(scores) == count || throw(ArgumentError("scores and candidates must have equal lengths"))
  skip_wait = count > 1 && candidate_kind(first(candidates)) == 0
- uniform_probability = _training_uniform_probability(count, skip_wait)
+ weight_sum = _training_exploration_weight_sum(candidates, skip_wait)
  return map(
   (index, log_probability) ->
-   _training_mixture_log_probability(Float32(log_probability), index, skip_wait, uniform_probability),
+   _training_mixture_log_probability(
+    Float32(log_probability), index, skip_wait,
+    TRAIN_EXPLORATION_FRACTION * _training_exploration_weight(candidates[index]) / weight_sum,
+   ),
   eachindex(candidates), Flux.logsoftmax(scores),
  )
 end
@@ -667,8 +677,8 @@ function _validate_checkpoint_payload(payload, fresh_optimizer_state)::Nothing
  Int(payload.entity_words) == ENTITY_WORDS || throw(ArgumentError("AI checkpoint entity shape is incompatible"))
  Int(payload.candidate_words) == CANDIDATE_WORDS || throw(ArgumentError("AI checkpoint candidate shape is incompatible"))
  Int(payload.max_candidates) == MAX_CANDIDATES || throw(ArgumentError("AI checkpoint candidate cap is incompatible"))
- Int(payload.catalog_version) in (4, CATALOG_VERSION) ||
-  throw(ArgumentError("AI checkpoint catalog version $(payload.catalog_version) is incompatible with staged-action catalog version $CATALOG_VERSION; use a compatible checkpoint or explicitly reset the old checkpoint and its league snapshots (--reset-train or train --reset)"))
+ Int(payload.catalog_version) in (4, 5, 6, CATALOG_VERSION) ||
+  throw(ArgumentError("AI checkpoint catalog version $(payload.catalog_version) is incompatible with catalog version $CATALOG_VERSION; use a compatible checkpoint or explicitly reset the old checkpoint and its league snapshots (--reset-train or train --reset)"))
  Int(payload.reward_version) in (3, REWARD_VERSION) ||
   throw(ArgumentError("AI checkpoint reward version $(payload.reward_version) is incompatible with rejection-feedback reward version $REWARD_VERSION; use a compatible checkpoint or explicitly reset the old checkpoint and its league snapshots (--reset-train or train --reset)"))
  Int(payload.policy_version) == POLICY_VERSION || throw(ArgumentError("AI checkpoint policy version is incompatible"))
@@ -698,7 +708,7 @@ function load_policy_checkpoint!(path::AbstractString, policy::AiPolicy, fresh_o
    from_reward_version=Int(payload.reward_version),
    to_reward_version=REWARD_VERSION,
    update_count=Int(payload.update_count),
-   warning="Resuming existing weights and optimizer with staged choices and rejection feedback; the action distribution and reward scale have changed, so further training is needed. The next checkpoint save will write current catalog and reward versions.",
+   warning="Resuming existing weights and optimizer after catalog/reward changes; further training may be needed. The next checkpoint save will write current catalog and reward versions.",
   )
  end
  return (update_count=Int(payload.update_count), optimizer_state=payload.optimizer_state)
