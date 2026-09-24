@@ -157,6 +157,11 @@ in its `.sms` setup. Observer and absent seats are never scheduled. Unsupported
 rosters and maps without eligible computer seats fail before checkpoint reset.
 Training must use `--workers 1`, because its checkpoint and league are shared
 mutable state.
+When alternatives exist, training samples each AI seat from a 20% policy and
+80% uniform non-wait mixture. `wait` remains selectable; every non-wait
+candidate retains probability even under a strongly wait-biased checkpoint.
+Only the mutable seat contributes PPO trajectories, whose likelihoods and
+entropy use the same mixture. Inference and league evaluation remain greedy.
 
 The coordinator also refreshes those files in `--data-dir` before validating
 selected maps or resetting a checkpoint. Direct training and evaluation runs

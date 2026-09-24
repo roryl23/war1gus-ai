@@ -29,6 +29,9 @@ const DEFAULT_CHECKPOINT_EVERY = 16
 const DEFAULT_LEAGUE_SNAPSHOT_EVERY = 8
 const DEFAULT_LEAGUE_MAX_SNAPSHOTS = 8
 const PPO_ALGORITHM = "trajectory-ppo-gae-v1"
+const TRAIN_EXPLORATION_FRACTION = 0.8f0
+const TRAIN_POLICY_FRACTION = 1.0f0 - TRAIN_EXPLORATION_FRACTION
+const TRAIN_LOG_POLICY_FRACTION = log(TRAIN_POLICY_FRACTION)
 
 
 function training_seed_from_environment()::Int
@@ -523,6 +526,37 @@ function candidate_log_probability_and_entropy(
  return _candidate_log_probability_and_entropy(candidate_scores(policy, observation), action)
 end
 
+@inline function _training_mixture_log_probability(
+ log_probability::Float32, index::Int, skip_wait::Bool, uniform_probability::Float32,
+)::Float32
+ # The excluded wait still has its policy mass; use log space so even a
+ # vanishingly unlikely wait retains a finite log probability.
+ if skip_wait && index == 1
+  return log_probability + TRAIN_LOG_POLICY_FRACTION
+ end
+ return log(TRAIN_POLICY_FRACTION * exp(log_probability) + uniform_probability)
+end
+
+@inline function _training_uniform_probability(count::Int, skip_wait::Bool)::Float32
+ return TRAIN_EXPLORATION_FRACTION / Float32(count - Int(skip_wait))
+end
+
+"""Log probabilities of the training policy mixture in original catalog order."""
+function training_action_log_probabilities(
+ scores::AbstractVector{<:Real}, candidates::AbstractVector{CandidateObservation},
+)::Vector{Float32}
+ count = length(candidates)
+ count > 0 || throw(ArgumentError("cannot sample an empty candidate sequence"))
+ length(scores) == count || throw(ArgumentError("scores and candidates must have equal lengths"))
+ skip_wait = count > 1 && candidate_kind(first(candidates)) == 0
+ uniform_probability = _training_uniform_probability(count, skip_wait)
+ return map(
+  (index, log_probability) ->
+   _training_mixture_log_probability(Float32(log_probability), index, skip_wait, uniform_probability),
+  eachindex(candidates), Flux.logsoftmax(scores),
+ )
+end
+
 function _sample_from_log_probabilities(log_probabilities::AbstractVector{<:Real}, rng::AbstractRNG)::Int
  isempty(log_probabilities) && throw(ArgumentError("cannot sample an empty candidate sequence"))
  threshold = rand(rng)
@@ -534,21 +568,10 @@ function _sample_from_log_probabilities(log_probabilities::AbstractVector{<:Real
  return length(log_probabilities) - 1
 end
 
-function sample_candidate(scores::AbstractVector{<:Real}, rng::AbstractRNG)::Int
- return _sample_from_log_probabilities(Flux.logsoftmax(scores), rng)
-end
-
-function _select_action(
- scores::AbstractVector{<:Real},
- log_probabilities::AbstractVector{<:Real};
- training::Bool,
- rng::AbstractRNG,
+function sample_candidate(
+ scores::AbstractVector{<:Real}, candidates::AbstractVector{CandidateObservation}, rng::AbstractRNG,
 )::Int
- return training ? _sample_from_log_probabilities(log_probabilities, rng) : argmax(scores) - 1
-end
-
-function _select_action(scores::AbstractVector{<:Real}; training::Bool, rng::AbstractRNG)::Int
- return training ? sample_candidate(scores, rng) : argmax(scores) - 1
+ return _sample_from_log_probabilities(training_action_log_probabilities(scores, candidates), rng)
 end
 
 """Choose greedily for inference and stochastically from supplied candidates during training."""
@@ -563,7 +586,7 @@ function select_action(
  else
   first(_inference_forward!(InferenceWorkspace(), policy, observation))
  end
- return _select_action(scores; training, rng)
+ return training ? sample_candidate(scores, observation.candidates, rng) : argmax(scores) - 1
 end
 
 function select_action(policy::AiPolicy, state::AbstractVector{<:Integer}; kwargs...)::Int
@@ -1291,9 +1314,14 @@ function process_step!(
    _log_reward_decomposition(state, sequence, reward, false)
   end
 
-  log_probabilities = Flux.logsoftmax(scores)
-  action = _select_action(scores, log_probabilities; training, rng=trainer.rng)
-  log_probability = log_probabilities[action+1]
+  if is_training(trainer)
+   log_probabilities = training_action_log_probabilities(scores, observation.candidates)
+   action = _sample_from_log_probabilities(log_probabilities, trainer.rng)
+   log_probability = log_probabilities[action+1]
+  else
+   action = argmax(scores) - 1
+   log_probability = 0.0f0
+  end
   collectable = training && !_worker_busy_locked(trainer)
   session.previous = Decision(
    state, observation, action, Float32(log_probability), Float32(value),

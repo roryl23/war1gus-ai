@@ -6,6 +6,7 @@ struct PpoBatch
  candidates::Matrix{Float32}
  entity_offsets::Vector{Int}
  candidate_offsets::Vector{Int}
+ first_waits::Vector{Bool}
  candidate_states::Vector{Int}
  actors::Vector{Int}
  targets_entity::Vector{Int}
@@ -28,6 +29,7 @@ function _pack_ppo_batch(
  candidates = Matrix{Float32}(undef, CANDIDATE_WORDS, total_candidates)
  entity_offsets = Vector{Int}(undef, count + 1)
  candidate_offsets = Vector{Int}(undef, count + 1)
+ first_waits = Vector{Bool}(undef, count)
  candidate_states = Vector{Int}(undef, total_candidates)
  actors = Vector{Int}(undef, total_candidates)
  targets_entity = Vector{Int}(undef, total_candidates)
@@ -46,6 +48,7 @@ function _pack_ppo_batch(
   0 <= step.action < length(observation.candidates) ||
    throw(ArgumentError("candidate index $(step.action) is outside the supplied candidate sequence"))
   entity_offsets[index] = next_entity
+  first_waits[index] = candidate_kind(first(observation.candidates)) == 0
   candidate_offsets[index] = next_candidate
   _feature_column!(headers, index, _header_features(observation.header))
   for entity in observation.entities
@@ -70,7 +73,7 @@ function _pack_ppo_batch(
  entity_offsets[end] = next_entity
  candidate_offsets[end] = next_candidate
  return PpoBatch(
-  headers, entities, candidates, entity_offsets, candidate_offsets, candidate_states,
+  headers, entities, candidates, entity_offsets, candidate_offsets, first_waits, candidate_states,
   actors, targets_entity, actions, bootstrap_scores,
   old_log_probabilities, old_values, targets, advantages,
  )
@@ -173,7 +176,7 @@ end
 
 # The segmented catalog derivative avoids a full-catalog tangent per state.
 function _segmented_policy_statistics_with_cache(
- scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int},
+ scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}, first_waits::Vector{Bool},
 )
  count = length(actions)
  statistics = Matrix{Float32}(undef, 2, count)
@@ -182,54 +185,72 @@ function _segmented_policy_statistics_with_cache(
  for index in eachindex(actions)
   first_candidate = offsets[index]
   last_candidate = offsets[index+1] - 1
+  skip_wait = first_waits[index] && last_candidate > first_candidate
+  uniform_probability = _training_uniform_probability(last_candidate - first_candidate + 1, skip_wait)
   segment_log_probabilities = Flux.logsoftmax(@view scores[first_candidate:last_candidate])
-  statistics[1, index] = segment_log_probabilities[actions[index]-first_candidate+1]
   entropy = 0.0f0
   for candidate in first_candidate:last_candidate
-   log_probability = segment_log_probabilities[candidate-first_candidate+1]
-   probability = exp(log_probability)
+   local_index = candidate - first_candidate + 1
+   policy_log_probability = segment_log_probabilities[local_index]
+   log_probability = _training_mixture_log_probability(
+    policy_log_probability, local_index, skip_wait, uniform_probability,
+   )
    log_probabilities[candidate] = log_probability
-   probabilities[candidate] = probability
-   entropy -= probability * log_probability
+   probabilities[candidate] = exp(policy_log_probability)
+   entropy -= exp(log_probability) * log_probability
   end
+  statistics[1, index] = log_probabilities[actions[index]]
   statistics[2, index] = entropy
  end
  return statistics, log_probabilities, probabilities
 end
 
-_segmented_policy_statistics(scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}) =
- first(_segmented_policy_statistics_with_cache(scores, offsets, actions))
+_segmented_policy_statistics(
+ scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}, first_waits::Vector{Bool},
+) = first(_segmented_policy_statistics_with_cache(scores, offsets, actions, first_waits))
 
 function ChainRulesCore.rrule(
  ::typeof(_segmented_policy_statistics),
- scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int},
+ scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}, first_waits::Vector{Bool},
 )
  statistics, log_probabilities, probabilities =
-  _segmented_policy_statistics_with_cache(scores, offsets, actions)
+  _segmented_policy_statistics_with_cache(scores, offsets, actions, first_waits)
  function segmented_pullback(cotangent)
   cotangent = ChainRulesCore.unthunk(cotangent)
   if cotangent isa ChainRulesCore.AbstractZero
    return (
     ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(),
-    ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(),
+    ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(),
    )
   end
   score_gradient = similar(scores)
   for index in eachindex(actions)
    log_probability_gradient = cotangent[1, index]
    entropy_gradient = cotangent[2, index]
-   entropy = statistics[2, index]
-   for candidate in offsets[index]:offsets[index+1]-1
+   first_candidate = offsets[index]
+   last_candidate = offsets[index+1] - 1
+   action = actions[index]
+   # The policy's softmax p is the only score-dependent part of q.
+   # Summing p_i log(q_i) (not q_i log(q_i)) is required by dH(q)/ds.
+   policy_weighted_log_probability = 0.0f0
+   for candidate in first_candidate:last_candidate
+    policy_weighted_log_probability += probabilities[candidate] * log_probabilities[candidate]
+   end
+   skip_wait = first_waits[index] && last_candidate > first_candidate
+   action_factor = skip_wait && action == first_candidate ? 1.0f0 :
+                   TRAIN_POLICY_FRACTION *
+                   probabilities[action] / exp(log_probabilities[action])
+   for candidate in first_candidate:last_candidate
     probability = probabilities[candidate]
     score_gradient[candidate] =
-     (candidate == actions[index] ? log_probability_gradient : 0.0f0) -
-     log_probability_gradient * probability -
-     entropy_gradient * probability * (log_probabilities[candidate] + entropy)
+     log_probability_gradient * action_factor * ((candidate == action ? 1.0f0 : 0.0f0) - probability) -
+     entropy_gradient * TRAIN_POLICY_FRACTION * probability *
+     (log_probabilities[candidate] - policy_weighted_log_probability)
    end
   end
   return (
    ChainRulesCore.NoTangent(), score_gradient,
-   ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(),
+   ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(),
   )
  end
  return statistics, segmented_pullback
@@ -262,7 +283,9 @@ function _ppo_loss(
 
  # Only the segmented reductions use custom rules; clipping retains ordinary
  # Flux AD semantics, including min/max/clamp tie behavior.
- statistics = _segmented_policy_statistics(scores, batch.candidate_offsets, batch.actions)
+ statistics = _segmented_policy_statistics(
+  scores, batch.candidate_offsets, batch.actions, batch.first_waits,
+ )
  log_probabilities = @view statistics[1, :]
  entropy = @view statistics[2, :]
  ratio = exp.(log_probabilities .- batch.old_log_probabilities)

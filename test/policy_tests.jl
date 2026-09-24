@@ -11,7 +11,7 @@ function scalar_ppo_reference(policy, steps, targets, advantages, clip_epsilon, 
   for index in eachindex(steps)
     step = steps[index]
     scores, value = War1gusAI._policy_forward(policy, step.observation)
-    log_probabilities = Flux.logsoftmax(scores)
+    log_probabilities = War1gusAI.training_action_log_probabilities(scores, step.observation.candidates)
     log_probability = log_probabilities[step.action+1]
     entropy = -sum(exp.(log_probabilities) .* log_probabilities)
     ratio = exp(log_probability - step.old_log_probability)
@@ -88,7 +88,7 @@ end
   steps = War1gusAI.TrajectoryStep[]
   for index in eachindex(observations)
     scores, value = War1gusAI._policy_forward(policy, observations[index])
-    log_probability = Flux.logsoftmax(scores)[actions[index]+1]
+    log_probability = War1gusAI.training_action_log_probabilities(scores, observations[index].candidates)[actions[index]+1]
     old_value = value - 1.0f0
     # Both max branches: target above the current value selects the clipped
     # critic; target at the old value selects the unclipped critic.
@@ -133,7 +133,7 @@ end
   for observation in (with_entity, without_entity)
     scores, value = War1gusAI._policy_forward(policy, observation)
     step = War1gusAI.TrajectoryStep(
-      observation, 1, 0.0f0, Flux.logsoftmax(scores)[2], value, false,
+      observation, 1, 0.0f0, War1gusAI.training_action_log_probabilities(scores, observation.candidates)[2], value, false,
     )
     batch = War1gusAI._pack_ppo_batch([step], Float32[value+1], Float32[0.7])
     result = Flux.withgradient(policy) do trained_policy
@@ -578,6 +578,94 @@ end
     @test !opponent_session.trainable
     @test !isnothing(opponent_session.frozen_policy)
     @test opponent_session.frozen_policy !== trainer.policy
+    # Frozen league opponents still sample actions, but never contribute PPO data.
+    frozen = opponent_session.frozen_policy::War1gusAI.AiPolicy
+    fill!(frozen.score_head.layers[2].weight, 0.0f0)
+    fill!(frozen.score_head.layers[2].bias, 0.0f0)
+    actor_state = v3_state(
+      player=1, entities=[v3_entity(slot=1)],
+      candidates=[v3_candidate(), v3_candidate(kind=13, actor=1)],
+    )
+    choices = Set(War1gusAI.process_step!(
+      trainer, opponent_session, UInt32(sequence), Int32(0), actor_state,
+    ) for sequence in 1:32)
+    @test choices == Set(0:1)
+    @test isempty(opponent_session.fragment)
+  end
+end
+
+@testset "league training explores despite a wait-biased checkpoint" begin
+  mktempdir() do directory
+    checkpoint = joinpath(directory, "wait-biased.jls")
+    policy = War1gusAI.create_policy(seed=61)
+    fill!(policy.score_head.layers[2].weight, 0.0f0)
+    fill!(policy.score_head.layers[2].bias, 0.0f0)
+    trainer = War1gusAI.create_trainer(
+      mode=War1gusAI.MODE_LEAGUE,
+      checkpoint_path=checkpoint,
+      policy=policy,
+      seed=61,
+      train_player=UInt32(0),
+      batch_size=128,
+      rollout_fragment=128,
+    )
+    War1gusAI.save_checkpoint!(trainer)
+    snapshot = only(trainer.league_snapshots)
+    train_session = War1gusAI.ClientSession()
+    opponent_session = War1gusAI.ClientSession()
+    biased_state = player -> v3_state(
+      player=player, entities=[v3_entity(slot=1)],
+      candidates=[v3_candidate(bootstrap=12_000), v3_candidate(kind=13, actor=1)],
+    )
+    train_state, opponent_state = biased_state(0), biased_state(1)
+    @test War1gusAI.candidate_scores(policy, War1gusAI.parse_state(train_state))[1] -
+          War1gusAI.candidate_scores(policy, War1gusAI.parse_state(train_state))[2] ≈ 12.0f0
+    train_choices = Int[]
+    opponent_choices = Int[]
+    for sequence in 0:31
+      push!(train_choices, War1gusAI.process_step!(
+        trainer, train_session, UInt32(sequence), Int32(0), train_state,
+      ))
+      push!(opponent_choices, War1gusAI.process_step!(
+        trainer, opponent_session, UInt32(sequence), Int32(0), opponent_state,
+      ))
+    end
+    @test 1 in train_choices
+    @test 1 in opponent_choices
+    scores = War1gusAI.candidate_scores(policy, War1gusAI.parse_state(train_state))
+    log_probabilities = War1gusAI.training_action_log_probabilities(
+      scores, War1gusAI.parse_state(train_state).candidates,
+    )
+    @test exp(log_probabilities[1]) ≈ 0.2f0 atol = 1f-4
+    @test exp(log_probabilities[2]) ≈ 0.8f0 atol = 1f-4
+    @test train_session.previous.log_probability ≈ log_probabilities[last(train_choices)+1] atol = 1f-6
+    @test !isempty(train_session.fragment)
+    @test isempty(opponent_session.fragment)
+
+    single_wait = player -> v3_state(player=player, candidates=[v3_candidate(bootstrap=12_000)])
+    @test War1gusAI.process_step!(
+      trainer, train_session, UInt32(32), Int32(0), single_wait(0),
+    ) == 0
+    @test War1gusAI.process_step!(
+      trainer, opponent_session, UInt32(32), Int32(0), single_wait(1),
+    ) == 0
+    @test isempty(opponent_session.fragment)
+
+    evaluation = War1gusAI.create_trainer(
+      mode=War1gusAI.MODE_LEAGUE_EVALUATE,
+      checkpoint_path=checkpoint,
+      league_snapshot_override=snapshot,
+      seed=67,
+      train_player=UInt32(0),
+    )
+    for state in (train_state, opponent_state)
+      session = War1gusAI.ClientSession()
+      @test all(
+        War1gusAI.process_step!(evaluation, session, UInt32(sequence), Int32(0), state) == 0
+        for sequence in 0:15
+      )
+      @test isempty(session.fragment)
+    end
   end
 end
 
