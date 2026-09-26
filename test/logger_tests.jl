@@ -113,6 +113,68 @@ function is_json_line(line::AbstractString)::Bool
   bytes = collect(codeunits(line))
   return json_value_end(bytes, 1) == length(bytes) + 1
 end
+const JSON_STRING_ESCAPES = Dict{UInt8,UInt8}(
+  UInt8('"') => UInt8('"'), UInt8('\\') => UInt8('\\'), UInt8('/') => UInt8('/'),
+  UInt8('b') => 0x08, UInt8('f') => 0x0c, UInt8('n') => 0x0a,
+  UInt8('r') => 0x0d, UInt8('t') => 0x09,
+)
+
+function decoded_json_string(bytes::Vector{UInt8}, start::Int)
+  stop = json_string_end(bytes, start)
+  stop != 0 || throw(ArgumentError("invalid JSON string"))
+  value = IOBuffer()
+  position = start + 1
+  while position < stop - 1
+    byte = bytes[position]
+    if byte != UInt8('\\')
+      write(value, byte)
+    else
+      position += 1
+      escape = bytes[position]
+      if escape == UInt8('u')
+        codepoint = parse(Int, String(bytes[position+1:position+4]); base=16)
+        position += 4
+        if 0xd800 <= codepoint <= 0xdbff
+          position + 6 < stop && bytes[position+1:position+2] == UInt8['\\', 'u'] ||
+            throw(ArgumentError("invalid JSON surrogate pair"))
+          low = parse(Int, String(bytes[position+3:position+6]); base=16)
+          0xdc00 <= low <= 0xdfff || throw(ArgumentError("invalid JSON surrogate pair"))
+          codepoint = 0x10000 + ((codepoint - 0xd800) << 10) + low - 0xdc00
+          position += 6
+        elseif 0xdc00 <= codepoint <= 0xdfff
+          throw(ArgumentError("invalid JSON surrogate pair"))
+        end
+        write(value, Char(codepoint))
+      else
+        escaped = get(JSON_STRING_ESCAPES, escape, nothing)
+        isnothing(escaped) && throw(ArgumentError("invalid JSON escape"))
+        write(value, escaped)
+      end
+    end
+    position += 1
+  end
+  return String(take!(value)), stop
+end
+
+function decoded_json_field(line::AbstractString, field::AbstractString)::String
+  bytes = collect(codeunits(line))
+  is_json_line(line) && bytes[1] == UInt8('{') || throw(ArgumentError("invalid JSON object"))
+  position = 2
+  while bytes[position] != UInt8('}')
+    key, position = decoded_json_string(bytes, position)
+    bytes[position] == UInt8(':') || throw(ArgumentError("invalid JSON field"))
+    position += 1
+    if key == field
+      value, _ = decoded_json_string(bytes, position)
+      return value
+    end
+    position = json_value_end(bytes, position)
+    bytes[position] == UInt8('}') && break
+    position += 1
+  end
+  throw(ArgumentError("missing JSON field: $field"))
+end
+
 mutable struct BlockingLoggerIO <: IO
   entered::Channel{Nothing}
   release::Base.Event
@@ -128,6 +190,7 @@ Base.write(::BlockingLoggerIO, ::UInt8)::Int = 1
 Base.flush(::BlockingLoggerIO)::Nothing = nothing
 
 @testset "event logger default path" begin
+  configured_path = joinpath(tempdir(), "custom-war1gus-ai.log")
   fallback_path = joinpath(Sys.BINDIR, "War1gusAI.log")
   withenv("WAR1GUS_AI_LOG_PATH" => nothing) do
     @test War1gusAI.default_log_path() == fallback_path
@@ -135,8 +198,8 @@ Base.flush(::BlockingLoggerIO)::Nothing = nothing
   withenv("WAR1GUS_AI_LOG_PATH" => "") do
     @test War1gusAI.default_log_path() == fallback_path
   end
-  withenv("WAR1GUS_AI_LOG_PATH" => "/tmp/custom-war1gus-ai.log") do
-    @test War1gusAI.default_log_path() == "/tmp/custom-war1gus-ai.log"
+  withenv("WAR1GUS_AI_LOG_PATH" => configured_path) do
+    @test War1gusAI.default_log_path() == configured_path
   end
 end
 
@@ -258,7 +321,7 @@ end
       @test all(is_json_line, lines)
       error_line = only(filter(line -> occursin("\"type\":\"logger_error\"", line), lines))
       @test occursin("\"operation\":\"open\"", error_line)
-      @test occursin("\"path\":\"$(directory)\"", error_line)
+      @test decoded_json_field(error_line, "path") == directory
       @test occursin("\"error\":\"", error_line)
     finally
       War1gusAI.stop_event_logger!()

@@ -79,6 +79,24 @@ the final published state. A checkpoint includes model and optimizer state plus
 protocol, observation shape, catalog, reward, policy, and PPO compatibility
 metadata.
 
+PPO can execute on a selected GPU, but the published policy and optimizer
+state remain on the CPU. Each background update transfers a policy/optimizer
+snapshot and its packed trajectory batch to the training device, then moves
+the trained state back before publication. Action selection, frozen-opponent
+evaluation, and checkpoint files always use CPU state, so checkpoints remain
+portable between GPU-enabled and CPU-only hosts.
+
+## Julia tests
+
+From this submodule directory, run the Julia suite on Windows or Linux:
+
+```sh
+julia --project=. -e "using Pkg; Pkg.test()"
+```
+
+The suite uses temporary files and the checked-in War1gus maps. It does not
+require the game build, shell launcher, or a GPU.
+
 ## Build and play
 
 The integration is Linux-focused. Build and extract War1gus, then enter this
@@ -97,6 +115,21 @@ test -n "$WAR1GUS_ROOT" || {
 julia --project="$AI_ROOT" -e 'using Pkg; Pkg.instantiate()'
 bash "$AI_ROOT/build.sh"
 ```
+
+CUDA support is included in the Julia project. NVIDIA training requires a
+usable CUDA-capable GPU and driver; a CPU-only machine can still instantiate,
+build, play, and train with the same project. To enable AMD GPU training on
+supported Linux systems with ROCm and a supported GPU, install the optional
+AMDGPU.jl package before building (or rebuild the application afterward):
+
+```sh
+julia --project="$AI_ROOT" -e 'using Pkg; Pkg.add("AMDGPU")'
+bash "$AI_ROOT/build.sh"
+```
+
+`Pkg.add` changes the local project/dependency lockfile; an AMDGPU installation
+is not required for NVIDIA or CPU use. Rebuild the packaged application after
+changing GPU dependencies so its Julia image includes the selected backend.
 
 Rebuild both Stratagus and War1gus from this directory. The coordinator requires
 the current engine's `SetFastForwardCycle` binding and synchronous socket
@@ -132,6 +165,23 @@ installed game-data copy. Set `WAR1GUS_AI_BINARY` to use a different executable.
 The child process starts only when an AI player needs it and closes when the
 game ends. `--train` enables online training; `--reset-train` deliberately
 removes the selected checkpoint and its sibling league before training.
+
+Training automatically selects a usable NVIDIA CUDA device first, then a
+supported AMDGPU device, and uses the CPU if neither backend initializes
+successfully. An installed package by itself does not imply that its GPU can
+train: backend initialization failures fall back to CPU, but failures during
+a selected GPU PPO update remain errors. Set
+`WAR1GUS_AI_TRAIN_DEVICE=cpu` on the process starting the game or coordinator
+to force CPU training even when a GPU is available. Other accepted values are
+`auto` (the default), `cuda`, and `amdgpu`; selecting an unavailable backend
+falls back to CPU rather than selecting the other GPU family. Direct Julia
+callers can use `create_trainer(training_device=:cpu)` (or `:auto`, `:cuda`,
+`:amdgpu`). GPU selection applies only to training modes; normal inference
+and read-only evaluations use the CPU regardless of this setting.
+
+The `training_device_selected` log event records the requested and selected
+backends and any initialization fallback reason; `ppo_update` records the
+backend used for each completed update.
 
 Normal play sends one nonblocking request per AI player at a time, advancing
 the staged choice across responses while gameplay continues. A late response

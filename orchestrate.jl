@@ -93,7 +93,7 @@ function map_trainable_seats(options, map::AbstractString)
   throw(ArgumentError("selected map must be a .smp presentation: $path"))
  presentation = read(path, String)
  declarations = collect(eachmatch(
-  r"(?m)^[ \t]*DefinePlayerTypes[ \t]*\(([^\r\n()]*)\)[ \t]*(?:--[^\r\n]*)?$",
+  r"(?m)^[ \t]*DefinePlayerTypes[ \t]*\(([^\r\n()]*)\)[ \t]*(?:--[^\r\n]*)?\r?$",
   presentation))
  length(declarations) == 1 ||
   throw(ArgumentError("map has no unique literal DefinePlayerTypes roster: $path"))

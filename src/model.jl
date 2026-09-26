@@ -1,4 +1,5 @@
 import ChainRulesCore
+import CUDA
 using Flux
 using LinearAlgebra
 using Random
@@ -795,13 +796,15 @@ struct PpoWorkerFailure
  backtrace
 end
 
-mutable struct OnlineTrainer{O,R<:AbstractRNG}
+mutable struct OnlineTrainer{O,R<:AbstractRNG,D}
  policy::AiPolicy
  optimizer_state::O
  lock::ReentrantLock
  checkpoint_lock::ReentrantLock
  mode::Symbol
  read_only::Bool
+ training_device::D
+ training_backend::Symbol
  gamma::Float32
  gae_lambda::Float32
  clip_epsilon::Float32
@@ -957,9 +960,51 @@ function _assign_session_locked!(trainer::OnlineTrainer, session::ClientSession,
  return nothing
 end
 
+function _probe_training_device(backend::Symbol)
+ try
+  if backend == :cuda
+   CUDA.functional() || return nothing, "CUDA is not functional"
+   device = Flux.CUDADevice()
+   device(Float32[0])
+   CUDA.allowscalar(false)
+   return device, nothing
+  end
+  # A compiled app may have AMDGPU in its image without package sources on disk.
+  @eval import AMDGPU
+  return Base.invokelatest() do
+   AMDGPU.functional() || return nothing, "AMDGPU is not functional"
+   device = Flux.AMDGPUDevice()
+   device(Float32[0])
+   AMDGPU.allowscalar(false)
+   return device, nothing
+  end
+ catch error
+  return nothing, sprint(showerror, error)
+ end
+end
+
+function _select_training_device(requested::Symbol, mode::Symbol, read_only::Bool)
+ requested in (:auto, :cpu, :cuda, :amdgpu) ||
+  throw(ArgumentError("training device must be auto, cpu, cuda, or amdgpu: $requested"))
+ if read_only || !(mode in (MODE_TRAIN, MODE_RESET_TRAIN, MODE_LEAGUE))
+  return Flux.cpu_device(), :cpu, "training is disabled"
+ end
+ requested == :cpu && return Flux.cpu_device(), :cpu, nothing
+ failures = String[]
+ for backend in (requested == :auto ? (:cuda, :amdgpu) : (requested,))
+  device, failure = _probe_training_device(backend)
+  if !isnothing(device)
+   return device, backend, isempty(failures) ? nothing : join(failures, "; ")
+  end
+  push!(failures, "$backend: $failure")
+ end
+ return Flux.cpu_device(), :cpu, join(failures, "; ")
+end
+
 function create_trainer(
  ;
  mode::Symbol=MODE_INFERENCE,
+ training_device::Symbol=Symbol(lowercase(strip(get(ENV, "WAR1GUS_AI_TRAIN_DEVICE", "auto")))),
  checkpoint_path::AbstractString=default_checkpoint_path(),
  seed::Integer=training_seed_from_environment(),
  gamma::Real=0.9995f0,
@@ -993,7 +1038,13 @@ function create_trainer(
  value_coefficient >= 0 || throw(ArgumentError("value coefficient must not be negative"))
  entropy_coefficient >= 0 || throw(ArgumentError("entropy coefficient must not be negative"))
 
- selected_policy = isnothing(policy) ? create_policy(seed=seed) : policy
+ selected_policy = if isnothing(policy)
+  create_policy(seed=seed)
+ elseif Flux.get_device_type(policy) <: Flux.CPUDevice
+  policy
+ else
+  Flux.cpu_device()(policy)
+ end
  selected_path = String(checkpoint_path)
  selected_league_path = abspath(String(league_path))
  selected_override = isnothing(league_snapshot_override) ? nothing : abspath(String(league_snapshot_override))
@@ -1005,9 +1056,15 @@ function create_trainer(
  else
   load_policy_checkpoint!(selected_path, selected_policy, fresh_optimizer_state)
  end
+ selected_device, selected_backend, fallback = _select_training_device(training_device, mode, read_only)
+ log_event(
+  "training_device_selected";
+  requested=String(training_device), selected=String(selected_backend),
+  mode=String(mode), read_only, fallback,
+ )
  trainer = OnlineTrainer(
   selected_policy, restored.optimizer_state, ReentrantLock(), ReentrantLock(), mode, read_only,
-  Float32(gamma), Float32(gae_lambda), Float32(clip_epsilon), Float32(value_coefficient),
+  selected_device, selected_backend, Float32(gamma), Float32(gae_lambda), Float32(clip_epsilon), Float32(value_coefficient),
   Float32(entropy_coefficient), restored.update_count, 0, selected_path, Int(batch_size),
   Int(rollout_fragment), Int(ppo_epochs), Int(checkpoint_every), TrajectoryFragment[], false,
   nothing, nothing, nothing, MersenneTwister(seed), train_player, Int(league_snapshot_every),
@@ -1107,6 +1164,9 @@ function _train_ppo_snapshot!(
  isempty(steps) && throw(ArgumentError("PPO update has no trajectory steps"))
  loss = 0.0f0
  batch = _pack_ppo_batch(steps, targets, advantages)
+ if trainer.training_backend != :cpu
+  batch = _ppo_batch_on_device(batch, trainer.training_device)
+ end
  for _ in 1:trainer.ppo_epochs
   result = Flux.withgradient(policy) do trained_policy
    _ppo_loss(
@@ -1139,7 +1199,16 @@ function _run_ppo_update_worker!(
 )::Nothing
  started_at = time_ns()
  try
+  if trainer.training_backend != :cpu
+   policy = trainer.training_device(policy)
+   optimizer_state = trainer.training_device(optimizer_state)
+  end
   loss, step_count = _train_ppo_snapshot!(trainer, policy, optimizer_state, fragments)
+  if trainer.training_backend != :cpu
+   cpu = Flux.cpu_device()
+   policy = cpu(policy)
+   optimizer_state = cpu(optimizer_state)
+  end
   update_count, checkpoint_due, league_snapshot_due = lock(trainer.lock) do
    trainer.policy_generation == dispatched_generation ||
     throw(ArgumentError("PPO worker published against an unexpected policy generation"))
@@ -1182,6 +1251,7 @@ function _run_ppo_update_worker!(
    fragments=length(fragments),
    steps=step_count,
    epochs=trainer.ppo_epochs,
+   training_backend=String(trainer.training_backend),
    loss,
    duration_ms,
    checkpoint_due,

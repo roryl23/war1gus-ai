@@ -2,22 +2,22 @@ using Test
 
 include(joinpath(@__DIR__, "..", "orchestrate.jl"))
 
-function orchestration_args(mode; extras=String[], data_dir="/tmp/war1gus-data", matches=8)
+function orchestration_args(mode; extras=String[], data_dir=joinpath(tempdir(), "war1gus-data"), matches=8)
  base = String[
-  mode, "--launcher", "/tmp/war1gus-launcher", "--data-dir", data_dir,
+  mode, "--launcher", joinpath(tempdir(), "war1gus-launcher"), "--data-dir", data_dir,
   "--matches", string(matches), "--workers", mode == "train" ? "1" : "3",
-  "--timeout-cycles", "12000", "--seed", "73", "--output", "/tmp/rollouts.jsonl",
-  "--state-root", "/tmp/war1gus-state", "--rollout-config", "/tmp/rollout.lua",
+  "--timeout-cycles", "12000", "--seed", "73", "--output", joinpath(tempdir(), "rollouts.jsonl"),
+  "--state-root", joinpath(tempdir(), "war1gus-state"), "--rollout-config", joinpath(tempdir(), "rollout.lua"),
  ]
  append!(base, extras)
  return base
 end
 
-function roster_map(data_dir, name, player_types; ai_types=Dict{Int,String}())
+function roster_map(data_dir, name, player_types; ai_types=Dict{Int,String}(), line_ending="\n")
  map = joinpath("maps", name * ".smp")
  path = joinpath(data_dir, map)
  mkpath(dirname(path))
- write(path, "DefinePlayerTypes(" * join(("\"" * type * "\"" for type in player_types), ", ") * ")\n")
+ write(path, "DefinePlayerTypes(" * join(("\"" * type * "\"" for type in player_types), ", ") * ")" * line_ending)
  write(replace(path, r"\.smp$" => ".sms"),
   join(("SetAiType($seat, \"$ai\")" for (seat, ai) in sort!(collect(ai_types); by=first)), "\n") * "\n")
  return map
@@ -30,9 +30,9 @@ end
  @test_throws ArgumentError parse_options(orchestration_args("train"; extras=["--map", "goldrush", "--workers", "2"]))
  @test_throws ArgumentError parse_options(orchestration_args("train"; extras=["--map", "goldrush", "--reset"]))
  @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice"]))
- @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice", "--league-snapshot", "/tmp/frozen-opponent"]))
- @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice", "--checkpoint", "/tmp/policy", "--reset"]))
- for (mode, selection) in (("train", ["--map", "goldrush"]), ("evaluate", ["--held-out-map", "ice", "--checkpoint", "/tmp/policy"]))
+ @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice", "--league-snapshot", joinpath(tempdir(), "frozen-opponent")]))
+ @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice", "--checkpoint", joinpath(tempdir(), "policy"), "--reset"]))
+ for (mode, selection) in (("train", ["--map", "goldrush"]), ("evaluate", ["--held-out-map", "ice", "--checkpoint", joinpath(tempdir(), "policy")]))
   @test_throws ArgumentError parse_options(orchestration_args(mode; extras=[selection; "--fast-forward"; "--fast-forward"]))
  end
 end
@@ -41,6 +41,8 @@ end
  mktempdir() do data_dir
   duel = roster_map(data_dir, "duel", ["computer", "computer", "person"];
    ai_types=Dict(0 => "war1gus-ai", 1 => "war1gus-ai"))
+  duel_crlf = roster_map(data_dir, "duel-crlf", ["computer", "computer", "person"];
+   ai_types=Dict(0 => "war1gus-ai", 1 => "war1gus-ai"), line_ending="\r\n")
   four = roster_map(data_dir, "four", ["computer", "computer", "computer", "computer", "person"];
    ai_types=Dict(seat => "war1gus-ai" for seat in 0:3))
   mixed = roster_map(data_dir, "mixed", ["person", "computer", "person", "computer", "person"];
@@ -53,6 +55,9 @@ end
   duel_schedule = build_schedule(duel_options)
   @test sort([match.train_player for match in duel_schedule]) == [0, 0, 1, 1]
   @test all(match -> match.train_player in (0, 1), duel_schedule)
+  crlf_options = parse_options(orchestration_args("train"; data_dir, matches=4,
+   extras=["--map", duel_crlf]))
+  @test sort([match.train_player for match in build_schedule(crlf_options)]) == [0, 0, 1, 1]
 
   four_options = parse_options(orchestration_args("train"; data_dir, matches=4,
    extras=["--map", four]))
@@ -74,7 +79,7 @@ end
 
   evaluate = parse_options(orchestration_args("evaluate"; data_dir,
    extras=["--map", duel, "--held-out-map", mixed, "--held-out-map", other_ai,
-    "--checkpoint", "/tmp/policy"]))
+    "--checkpoint", joinpath(tempdir(), "policy")]))
   evaluation_schedule = build_schedule(evaluate)
   @test evaluation_schedule == build_schedule(evaluate)
   @test all(match -> match.map in (mixed, other_ai), evaluation_schedule)
@@ -224,11 +229,16 @@ end
 
 @testset "match commands isolate state and preserve train versus evaluation contracts" begin
  mktempdir() do data_dir
+  checkpoint = joinpath(data_dir, "checkpoints", "checkpoint")
+  snapshot = joinpath(data_dir, "snapshot")
+  frozen_policy = joinpath(data_dir, "frozen-policy")
+  frozen_snapshot = joinpath(data_dir, "frozen-snapshot")
+  absolute_map = joinpath(data_dir, "already-absolute.smp")
   map = roster_map(data_dir, "goldrush", ["computer", "computer", "person"];
    ai_types=Dict(0 => "war1gus-ai", 1 => "war1gus-ai"))
   held_out = roster_map(data_dir, "ice", ["computer", "computer", "person"];
    ai_types=Dict(0 => "war1gus-ai", 1 => "war1gus-ai"))
-  train = parse_options(orchestration_args("train"; data_dir, extras=["--map", map, "--checkpoint", "/tmp/checkpoint", "--league-snapshot", "/tmp/snapshot", "--reset"]))
+  train = parse_options(orchestration_args("train"; data_dir, extras=["--map", map, "--checkpoint", checkpoint, "--league-snapshot", snapshot, "--reset"]))
   @test train.workers == 1
   schedule = build_schedule(train)
   first_command, first_environment, first_paths = build_match_command(train, schedule[1])
@@ -245,7 +255,7 @@ end
   @test first_command.exec[data_index+1] == train.data_dir
   @test first_command.exec[config_index+1] == train.rollout_config
   @test first_environment["WAR1GUS_ROLLOUT_MAP"] == abspath(joinpath(train.data_dir, schedule[1].map))
-  @test rollout_map_path(train, "/tmp/already-absolute.smp") == "/tmp/already-absolute.smp"
+  @test rollout_map_path(train, absolute_map) == absolute_map
   @test Set(["WAR1GUS_ROLLOUT_MAP", "WAR1GUS_ROLLOUT_SEED", "WAR1GUS_ROLLOUT_TRAIN_PLAYER",
    "WAR1GUS_ROLLOUT_TIMEOUT_CYCLES", "WAR1GUS_ROLLOUT_MATCH_ID", "WAR1GUS_ROLLOUT_MODE",
    "WAR1GUS_AI_TRAIN_PLAYER", "WAR1GUS_AI_SEED", "WAR1GUS_AI_BINARY", "WAR1GUS_AI_CHECKPOINT",
@@ -254,8 +264,9 @@ end
         Set(keys(first_environment))
   @test first_environment["WAR1GUS_AI_SEED"] == string(schedule[1].seed)
   @test first_environment["WAR1GUS_AI_BINARY"] == joinpath(dirname(train.rollout_config), "build", "bin", "War1gusAI")
-  @test first_environment["WAR1GUS_AI_CHECKPOINT"] == "/tmp/checkpoint"
-  @test first_environment["WAR1GUS_AI_LEAGUE_DIR"] == "/tmp/league"
+  @test first_environment["WAR1GUS_AI_CHECKPOINT"] == checkpoint
+  @test first_environment["WAR1GUS_AI_LEAGUE_DIR"] == joinpath(dirname(checkpoint), "league")
+  @test first_environment["WAR1GUS_AI_SNAPSHOT"] == snapshot
   @test first_environment["WAR1GUS_AI_LEAGUE_DIR"] == next_environment["WAR1GUS_AI_LEAGUE_DIR"]
   @test first_environment["WAR1GUS_AI_CHECKPOINT"] == next_environment["WAR1GUS_AI_CHECKPOINT"]
   @test first_environment["WAR1GUS_AI_SNAPSHOT"] == next_environment["WAR1GUS_AI_SNAPSHOT"]
@@ -275,20 +286,20 @@ end
   @test shared_checkpoint == default_next_environment["WAR1GUS_AI_CHECKPOINT"]
   @test default_first_environment["WAR1GUS_AI_LEAGUE_DIR"] == joinpath(dirname(shared_checkpoint), "league")
 
-  evaluate = parse_options(orchestration_args("evaluate"; data_dir, extras=["--held-out-map", held_out, "--checkpoint", "/tmp/frozen-policy", "--league-snapshot", "/tmp/frozen-snapshot"]))
+  evaluate = parse_options(orchestration_args("evaluate"; data_dir, extras=["--held-out-map", held_out, "--checkpoint", frozen_policy, "--league-snapshot", frozen_snapshot]))
   evaluation_command, evaluation_environment, _ = build_match_command(evaluate, first(build_schedule(evaluate)))
   @test "--league-evaluate" in evaluation_command.exec
   @test !in("--league-train", evaluation_command.exec)
   @test !in("--reset-train", evaluation_command.exec)
   @test "-b" in evaluation_command.exec
   @test evaluation_environment["WAR1GUS_AI_READ_ONLY"] == "1"
-  @test evaluation_environment["WAR1GUS_AI_CHECKPOINT"] == "/tmp/frozen-policy"
-  @test evaluation_environment["WAR1GUS_AI_SNAPSHOT"] == "/tmp/frozen-snapshot"
-  @test evaluation_environment["WAR1GUS_AI_LEAGUE_DIR"] == "/tmp/league"
+  @test evaluation_environment["WAR1GUS_AI_CHECKPOINT"] == frozen_policy
+  @test evaluation_environment["WAR1GUS_AI_SNAPSHOT"] == frozen_snapshot
+  @test evaluation_environment["WAR1GUS_AI_LEAGUE_DIR"] == joinpath(dirname(frozen_policy), "league")
   withenv("WAR1GUS_ROLLOUT_FAST_FORWARD" => "1") do
    @test child_environment(default_first_environment)["WAR1GUS_ROLLOUT_FAST_FORWARD"] == "0"
    @test child_environment(evaluation_environment)["WAR1GUS_ROLLOUT_FAST_FORWARD"] == "0"
-   for (mode, selection) in (("train", ["--map", map]), ("evaluate", ["--held-out-map", held_out, "--checkpoint", "/tmp/frozen-policy"]))
+   for (mode, selection) in (("train", ["--map", map]), ("evaluate", ["--held-out-map", held_out, "--checkpoint", frozen_policy]))
     options = parse_options(orchestration_args(mode; data_dir, extras=[selection; "--fast-forward"]))
     _, overrides, _ = build_match_command(options, first(build_schedule(options)))
     @test child_environment(overrides)["WAR1GUS_ROLLOUT_FAST_FORWARD"] == "1"

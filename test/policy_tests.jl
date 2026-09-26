@@ -41,9 +41,8 @@ function policy_gradient_arrays(gradient)
   )
 end
 
-@testset "packed PPO matches scalar objective and every trainable gradient" begin
-  policy = War1gusAI.create_policy(seed=43)
-  observations = [
+function representative_ppo_observations()
+  return [
     War1gusAI.parse_state(v3_state(
       cycle=101,
       entities=[v3_entity(slot=1, hp=20), v3_entity(slot=2, role=3), v3_entity(slot=3, relation=2)],
@@ -81,6 +80,11 @@ end
       ],
     )),
   ]
+end
+
+@testset "packed PPO matches scalar objective and every trainable gradient" begin
+  policy = War1gusAI.create_policy(seed=43)
+  observations = representative_ppo_observations()
   actions = [3, 2, 2, 1] # Zero-based catalog indices, including the concentrated logit.
   ratios = Float32[1.6, 0.5, 1.05, 0.95]
   advantages = Float32[1.0, -0.8, 0.6, -0.7]
@@ -117,6 +121,183 @@ end
     # scalar path, particularly through the segmented entity mean.
     @test actual ≈ expected atol = 3f-5 rtol = 3f-4
   end
+end
+
+function representative_ppo_fragments(policy)
+  observations = representative_ppo_observations()
+  actions = (3, 2, 2, 1)
+  rewards = (1.0f0, -0.4f0, 0.8f0, 2.0f0)
+  steps = War1gusAI.TrajectoryStep[]
+  for (index, observation) in enumerate(observations)
+    scores, value = War1gusAI._policy_forward(policy, observation)
+    log_probability = War1gusAI.training_action_log_probabilities(scores, observation.candidates)[actions[index]+1]
+    push!(steps, War1gusAI.TrajectoryStep(
+      observation, actions[index], rewards[index], log_probability, value, index == length(observations),
+    ))
+  end
+  return [War1gusAI.TrajectoryFragment(steps, 0.0f0, true)]
+end
+
+function all_optimizer_arrays_on_cpu(state)
+  state isa AbstractArray && return state isa Array
+  return all(index -> all_optimizer_arrays_on_cpu(getfield(state, index)), 1:fieldcount(typeof(state)))
+end
+
+function same_optimizer_state(actual, expected)
+  typeof(actual) == typeof(expected) || return false
+  actual isa AbstractArray && return actual == expected
+  (actual isa Number || actual isa Symbol || actual isa AbstractString ||
+   fieldcount(typeof(actual)) == 0) && return actual == expected
+  return all(
+    index -> same_optimizer_state(getfield(actual, index), getfield(expected, index)),
+    1:fieldcount(typeof(actual)),
+  )
+end
+
+@testset "selected training device updates CPU inference and portable checkpoints" begin
+  for requested_device in (:cpu, :auto, :amdgpu)
+    mktempdir() do directory
+      checkpoint = joinpath(directory, "device-ppo.jls")
+      trainer = War1gusAI.create_trainer(
+        mode=War1gusAI.MODE_TRAIN, checkpoint_path=checkpoint, seed=43, read_only=false,
+        batch_size=4, ppo_epochs=2, checkpoint_every=1, training_device=requested_device,
+      )
+      if requested_device == :cpu
+        @test trainer.training_backend == :cpu
+      elseif requested_device == :amdgpu
+        @test trainer.training_backend in (:cpu, :amdgpu)
+        if Base.find_package("AMDGPU") === nothing
+          @test trainer.training_backend == :cpu
+        end
+      else
+        @test trainer.training_backend in (:cpu, :cuda, :amdgpu)
+        if War1gusAI.CUDA.functional()
+          @test trainer.training_backend == :cuda
+        end
+      end
+      @test trainer.policy.header_encoder.weight isa Matrix{Float32}
+      @test all_optimizer_arrays_on_cpu(trainer.optimizer_state)
+      observation = first(representative_ppo_observations())
+      before_scores = War1gusAI.candidate_scores(trainer.policy, observation)
+      before_value = War1gusAI.value_estimate(trainer.policy, observation)
+      before_state = model_state_snapshot(trainer.policy)
+      before_optimizer = deepcopy(trainer.optimizer_state)
+      fragments = representative_ppo_fragments(trainer.policy)
+      if requested_device != :cpu && trainer.training_backend != :cpu
+        steps, targets, advantages = War1gusAI.trajectory_targets_and_advantages(trainer, fragments)
+        packed = War1gusAI._pack_ppo_batch(steps, targets, advantages)
+        gpu_batch = War1gusAI._ppo_batch_on_device(packed, trainer.training_device)
+        gpu_policy = trainer.training_device(deepcopy(trainer.policy))
+        @test !(gpu_batch.headers isa Matrix)
+        @test !(gpu_policy.header_encoder.weight isa Matrix)
+        gpu_result = Flux.withgradient(gpu_policy) do policy
+          War1gusAI._ppo_loss(
+            policy, gpu_batch, trainer.clip_epsilon, trainer.value_coefficient,
+            trainer.entropy_coefficient,
+          )
+        end
+        @test isfinite(Float32(gpu_result.val))
+        @test !(gpu_result.grad[1].header_encoder.weight isa Matrix)
+        @test !(gpu_result.grad[1].entity_encoder.weight isa Matrix)
+        cpu_result = Flux.withgradient(trainer.policy) do policy
+          War1gusAI._ppo_loss(
+            policy, packed, trainer.clip_epsilon, trainer.value_coefficient,
+            trainer.entropy_coefficient,
+          )
+        end
+        @test Float32(gpu_result.val) ≈ cpu_result.val atol = 2f-4 rtol = 2f-4
+        for (actual, expected) in zip(
+          policy_gradient_arrays(gpu_result.grad[1]), policy_gradient_arrays(cpu_result.grad[1]),
+        )
+          @test Array(actual) ≈ expected atol = 4f-4 rtol = 3f-3
+        end
+        empty_observation = representative_ppo_observations()[3]
+        empty_scores, empty_value = War1gusAI._policy_forward(trainer.policy, empty_observation)
+        empty_step = War1gusAI.TrajectoryStep(
+          empty_observation, 2, 1.0f0,
+          War1gusAI.training_action_log_probabilities(
+            empty_scores, empty_observation.candidates,
+          )[3],
+          empty_value, true,
+        )
+        empty_batch = War1gusAI._pack_ppo_batch(
+          [empty_step], Float32[empty_value+1.0f0], Float32[1.0f0],
+        )
+        empty_gpu_batch = War1gusAI._ppo_batch_on_device(empty_batch, trainer.training_device)
+        empty_gpu = Flux.withgradient(gpu_policy) do policy
+          War1gusAI._ppo_loss(
+            policy, empty_gpu_batch, trainer.clip_epsilon, trainer.value_coefficient,
+            trainer.entropy_coefficient,
+          )
+        end
+        empty_cpu = Flux.withgradient(trainer.policy) do policy
+          War1gusAI._ppo_loss(
+            policy, empty_batch, trainer.clip_epsilon, trainer.value_coefficient,
+            trainer.entropy_coefficient,
+          )
+        end
+        @test isnothing(empty_gpu.grad[1].entity_encoder)
+        @test Float32(empty_gpu.val) ≈ empty_cpu.val atol = 2f-4 rtol = 2f-4
+        @test Array(empty_gpu.grad[1].candidate_encoder.weight) ≈
+              empty_cpu.grad[1].candidate_encoder.weight atol = 4f-4 rtol = 3f-3
+      end
+      push!(trainer.pending_fragments, only(fragments))
+      @test isfinite(War1gusAI.flush_trajectories!(trainer))
+      @test trainer.update_count == trainer.policy_generation == 1
+      @test Flux.state(trainer.policy) != before_state
+      @test War1gusAI.candidate_scores(trainer.policy, observation) != before_scores
+      @test War1gusAI.value_estimate(trainer.policy, observation) != before_value
+      @test trainer.policy.header_encoder.weight isa Matrix{Float32}
+      @test all_optimizer_arrays_on_cpu(trainer.optimizer_state)
+      @test !same_optimizer_state(trainer.optimizer_state, before_optimizer)
+      trained_scores = War1gusAI.candidate_scores(trainer.policy, observation)
+      @test War1gusAI.select_action(trainer.policy, observation) == argmax(trained_scores) - 1
+
+      payload = open(deserialize, checkpoint)
+      @test payload.update_count == 1
+      @test payload.model_state == Flux.state(trainer.policy)
+      @test all_optimizer_arrays_on_cpu(payload.optimizer_state)
+      @test same_optimizer_state(payload.optimizer_state, trainer.optimizer_state)
+      restored = War1gusAI.create_trainer(
+        mode=War1gusAI.MODE_TRAIN, checkpoint_path=checkpoint, seed=43, read_only=false,
+        batch_size=4, ppo_epochs=1, checkpoint_every=1, training_device=:cpu,
+      )
+      @test restored.update_count == 1
+      @test Flux.state(restored.policy) == Flux.state(trainer.policy)
+      @test same_optimizer_state(restored.optimizer_state, trainer.optimizer_state)
+      @test War1gusAI.candidate_scores(restored.policy, observation) == trained_scores
+      @test War1gusAI.select_action(restored.policy, observation) ==
+            War1gusAI.select_action(trainer.policy, observation)
+      inference_checkpoint = War1gusAI.create_trainer(
+        mode=War1gusAI.MODE_INFERENCE, checkpoint_path=checkpoint, seed=43,
+        training_device=:cuda,
+      )
+      @test inference_checkpoint.training_backend == :cpu
+      @test Flux.state(inference_checkpoint.policy) == Flux.state(trainer.policy)
+      @test War1gusAI.candidate_scores(inference_checkpoint.policy, observation) == trained_scores
+      restored_before = model_state_snapshot(restored.policy)
+      push!(restored.pending_fragments, only(representative_ppo_fragments(restored.policy)))
+      @test isfinite(War1gusAI.flush_trajectories!(restored))
+      @test restored.update_count == 2
+      @test Flux.state(restored.policy) != restored_before
+      @test all_optimizer_arrays_on_cpu(restored.optimizer_state)
+      @test !same_optimizer_state(restored.optimizer_state, payload.optimizer_state)
+    end
+  end
+  withenv("WAR1GUS_AI_TRAIN_DEVICE" => "cpu") do
+    configured = War1gusAI.create_trainer(
+      mode=War1gusAI.MODE_TRAIN, checkpoint_path=tempname(), seed=43, read_only=false,
+    )
+    @test configured.training_backend == :cpu
+  end
+  inference = War1gusAI.create_trainer(
+    mode=War1gusAI.MODE_INFERENCE, checkpoint_path=tempname(), seed=43,
+    training_device=:cuda,
+  )
+  @test inference.training_backend == :cpu
+  observation = first(representative_ppo_observations())
+  @test War1gusAI.select_action(inference.policy, observation) ==
+        argmax(War1gusAI.candidate_scores(inference.policy, observation)) - 1
 end
 
 @testset "opening hints bias exploration without removing other choices" begin

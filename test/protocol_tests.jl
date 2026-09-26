@@ -209,13 +209,14 @@ end
   selected_seed = withenv("WAR1GUS_AI_SEED" => "73") do
     War1gusAI.training_seed_from_environment()
   end
-  configured_checkpoint = withenv("WAR1GUS_AI_CHECKPOINT" => "/tmp/shared-ppo.jls") do
+  checkpoint_path = joinpath(tempdir(), "shared-ppo.jls")
+  configured_checkpoint = withenv("WAR1GUS_AI_CHECKPOINT" => checkpoint_path) do
     War1gusAI.default_checkpoint_path()
   end
   @test selected_seed == 73
   @test configured == (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_LEAGUE)
   @test evaluation == (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_LEAGUE_EVALUATE)
-  @test configured_checkpoint == "/tmp/shared-ppo.jls"
+  @test configured_checkpoint == checkpoint_path
   @test command_override == (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_LEAGUE_EVALUATE)
   @test restart_override == (War1gusAI.DEFAULT_HOST, War1gusAI.DEFAULT_PORT, War1gusAI.MODE_TRAIN)
 end
