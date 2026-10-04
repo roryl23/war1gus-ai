@@ -2,7 +2,9 @@
 # Standalone rollout coordinator.  It deliberately uses only Julia's standard library.
 
 using Random
+using Sockets
 
+const DEFAULT_WALL_TIMEOUT_SECONDS = 7200
 const REQUIRED_OPTIONS = (:launcher, :data_dir, :matches, :workers, :timeout_cycles, :seed,
  :output, :state_root, :rollout_config)
 
@@ -14,10 +16,12 @@ function parse_options(arguments::Vector{String})
  values = Dict{Symbol,Any}(
   :maps => String[], :held_out_maps => String[], :reset => false, :fast_forward => false,
   :checkpoint => nothing, :league_snapshot => nothing,
+  :wall_timeout_seconds => DEFAULT_WALL_TIMEOUT_SECONDS,
  )
  option_names = Dict(
   "--launcher" => :launcher, "--data-dir" => :data_dir, "--matches" => :matches,
   "--workers" => :workers, "--timeout-cycles" => :timeout_cycles, "--seed" => :seed,
+  "--wall-timeout-seconds" => :wall_timeout_seconds,
   "--output" => :output, "--state-root" => :state_root,
   "--checkpoint" => :checkpoint, "--league-snapshot" => :league_snapshot,
   "--rollout-config" => :rollout_config,
@@ -42,7 +46,7 @@ function parse_options(arguments::Vector{String})
    key in specified && throw(ArgumentError("$argument may be supplied once"))
    push!(specified, key)
    raw = arguments[index+1]
-   values[key] = key in (:matches, :workers, :timeout_cycles, :seed) ? parse(Int, raw) : raw
+   values[key] = key in (:matches, :workers, :timeout_cycles, :seed, :wall_timeout_seconds) ? parse(Int, raw) : raw
    index += 2
   else
    throw(ArgumentError("unknown option: $argument"))
@@ -64,6 +68,7 @@ function parse_options(arguments::Vector{String})
  values[:matches] <= 20_000 || throw(ArgumentError("--matches exceeds available isolated port range"))
  values[:workers] > 0 || throw(ArgumentError("--workers must be positive"))
  values[:timeout_cycles] > 0 || throw(ArgumentError("--timeout-cycles must be positive"))
+ values[:wall_timeout_seconds] > 0 || throw(ArgumentError("--wall-timeout-seconds must be positive"))
  values[:seed] >= 0 || throw(ArgumentError("--seed must be nonnegative"))
  all(value -> !isempty(value), values[:maps]) || throw(ArgumentError("--map must not be empty"))
  all(value -> !isempty(value), values[:held_out_maps]) || throw(ArgumentError("--held-out-map must not be empty"))
@@ -79,7 +84,8 @@ function parse_options(arguments::Vector{String})
  end
  return (; mode, launcher=values[:launcher], data_dir=values[:data_dir], maps=copy(values[:maps]),
   held_out_maps=copy(values[:held_out_maps]), matches=values[:matches], workers=values[:workers],
-  timeout_cycles=values[:timeout_cycles], seed=values[:seed], output=values[:output],
+  timeout_cycles=values[:timeout_cycles], wall_timeout_seconds=values[:wall_timeout_seconds],
+  seed=values[:seed], output=values[:output],
   state_root=values[:state_root], checkpoint=values[:checkpoint],
   league_snapshot=values[:league_snapshot], reset=values[:reset],
   fast_forward=values[:fast_forward], rollout_config=values[:rollout_config])
@@ -128,8 +134,37 @@ function map_trainable_seats(options, map::AbstractString)
  return seats
 end
 
+"""Select a distinct non-ephemeral port per match without consuming the schedule RNG."""
+function safe_match_ports(ephemeral_low::Int, ephemeral_high::Int)
+ 1 <= ephemeral_low <= ephemeral_high <= 65535 ||
+  throw(ArgumentError("invalid Linux ephemeral port range: $ephemeral_low $ephemeral_high"))
+ # Prefer unprivileged low ports when the host uses the usual 32768..60999 range.
+ candidates = (10_001:65_535, 1024:10_000)
+ return [port for range in candidates for port in range
+         if !(ephemeral_low <= port <= ephemeral_high)]
+end
+
+function match_port_schedule(matches::Int, state_root::AbstractString, ephemeral_low::Int, ephemeral_high::Int)
+ ports = safe_match_ports(ephemeral_low, ephemeral_high)
+ length(ports) >= matches ||
+  throw(ArgumentError("only $(length(ports)) non-ephemeral ports available for $matches matches; Linux ephemeral range is $ephemeral_low..$ephemeral_high"))
+ # Separate run roots normally select different ports, without changing seed/seat draws.
+ rotation = Int(mod(hash(abspath(state_root), UInt(0)), UInt(length(ports))))
+ return [ports[mod1(rotation + ordinal, length(ports))] for ordinal in 1:matches]
+end
+
+function linux_ephemeral_port_range()
+ path = "/proc/sys/net/ipv4/ip_local_port_range"
+ isfile(path) || throw(ArgumentError("Linux ephemeral port range unavailable: $path"))
+ fields = split(strip(read(path, String)))
+ length(fields) == 2 || throw(ArgumentError("invalid Linux ephemeral port range in $path"))
+ return parse(Int, fields[1]), parse(Int, fields[2])
+end
+
 """Construct a reproducible, precomputed match schedule so worker ordering cannot affect it."""
 function build_schedule(options)
+ ephemeral_low, ephemeral_high = linux_ephemeral_port_range()
+ ports = match_port_schedule(options.matches, options.state_root, ephemeral_low, ephemeral_high)
  rng = MersenneTwister(options.seed)
  maps = options.mode == "train" ? options.maps : options.held_out_maps
  eligible_seats = [map_trainable_seats(options, map) for map in maps]
@@ -151,7 +186,8 @@ function build_schedule(options)
   end
   push!(child_seeds, child_seed)
   match_id = string(options.mode, "-", lpad(ordinal, 6, '0'), "-", string(child_seed, base=16))
-  push!(schedule, (; ordinal, map, train_player=seat, seed=child_seed, port=43_000 + ordinal,
+  port = ports[ordinal]
+  push!(schedule, (; ordinal, map, train_player=seat, seed=child_seed, port,
    match_id, mode=options.mode))
  end
  return schedule
@@ -523,29 +559,73 @@ function emit!(io::IO, event_lock::ReentrantLock, type::AbstractString; fields..
  return nothing
 end
 
+"""Check the address the AI binds before starting a match; the AI remains responsible for bind races."""
+function require_available_port(port::Int)
+ try
+  socket = listen(ip"0.0.0.0", port)
+  close(socket)
+ catch error
+  throw(ErrorException("AI port $port is unavailable: $(sprint(showerror, error))"))
+ end
+ return nothing
+end
+
+"""Run one launcher in its own Linux process group and reap it on every exit path."""
+function run_match_process(command, environment, child_log, timeout_seconds::Int)
+ spawned = run(pipeline(detach(setenv(command, child_environment(environment))),
+   stdout=child_log, stderr=child_log); wait=false)
+ leader = spawned isa Base.Process ? spawned : first(spawned.processes)
+ group_id = getpid(leader)
+ timed_out = false
+ try
+  timed_out = timedwait(() -> !process_running(leader), timeout_seconds; pollint=0.1) == :timed_out
+ finally
+  # Detached processes have a private process group. Kill it even if the launcher
+  # exited first, since the Julia server may otherwise outlive its parent.
+  # Preserve the group ID: getpid(leader) fails once the launcher has exited.
+  result = ccall(:kill, Cint, (Cint, Cint), -group_id, Base.SIGKILL)
+  kill_errno = result == 0 ? 0 : Base.Libc.errno()
+  wait(spawned)
+  (result == 0 || kill_errno == Base.Libc.ESRCH) ||
+   throw(SystemError("kill launcher process group $group_id", kill_errno))
+ end
+ return timed_out, leader.exitcode
+end
+
 function run_one_match(options, match, output, output_lock)
  command, environment, paths = build_match_command(options, match)
- mkpath(paths.root)
+ mkpath(dirname(paths.root))
+ mkdir(paths.root) # Never overwrite a prior invocation's match logs.
  mkpath(paths.xdg_state)
  if options.mode == "train"
   mkpath(dirname(environment["WAR1GUS_AI_CHECKPOINT"]))
   mkpath(environment["WAR1GUS_AI_LEAGUE_DIR"])
  end
  emit!(output, output_lock, "match_start"; match_id=match.match_id, map=match.map, mode=match.mode, command=command.exec)
+ timed_out = false
  status = 1
+ launch_error = nothing
  open(paths.child_log, "w") do child_log
-  # The child owns its stdout; engine noise remains in this per-match log.
   try
-   run(pipeline(setenv(command, child_environment(environment)), stdout=child_log, stderr=child_log))
-   status = 0
+   require_available_port(match.port)
+   timed_out, status = run_match_process(command, environment, child_log, options.wall_timeout_seconds)
   catch error
-   status = error isa ProcessFailedException ? first(error.procs).exitcode : 1
+   launch_error = sprint(showerror, error)
   end
  end
+ if timed_out
+  reason = "launcher and descendants exceeded $(options.wall_timeout_seconds)s wall-clock limit"
+  emit!(output, output_lock, "child_timeout"; match_id=match.match_id, timeout_seconds=options.wall_timeout_seconds,
+   error=reason, log_path=paths.child_log)
+  throw(ErrorException("$reason for $(match.match_id)"))
+ end
  events = collect_result_events(paths)
- if status != 0
-  emit!(output, output_lock, "child_failure"; match_id=match.match_id, exit_code=status, log_path=paths.child_log)
-  throw(ErrorException("launcher failed for $(match.match_id) with exit code $status"))
+ if status != 0 || launch_error !== nothing
+  ai_errors = [string(get(event, "error", event)) for event in events if get(event, "type", nothing) == "error"]
+  reason = something(launch_error, isempty(ai_errors) ? "launcher exited with code $status" : join(ai_errors, "; "))
+  emit!(output, output_lock, "child_failure"; match_id=match.match_id, exit_code=status,
+   error=reason, log_path=paths.child_log)
+  throw(ErrorException("launcher failed for $(match.match_id): $reason"))
  end
  terminal = try
   require_rollout_terminal(events, match; expected_map=rollout_map_path(options, match.map))
@@ -599,19 +679,29 @@ function validate_selected_maps(options)
  end
  return nothing
 end
-function run_orchestration(options)
+function run_orchestration(options; output_created=Ref(false))
+ ispath(options.output) && throw(ArgumentError("output already exists; use a fresh run path: $(options.output)"))
  validate_runtime_paths(options)
  sync_runtime_files(options)
  validate_selected_maps(options)
  schedule = build_schedule(options)
- options.mode == "train" && options.reset && reset_training_state!(options)
+ for match in schedule
+  ispath(match_paths(options, match).root) &&
+   throw(ArgumentError("match state already exists; use a fresh --state-root: $(match_paths(options, match).root)"))
+ end
  mkpath(dirname(options.output))
  mkpath(options.state_root)
+ mkdir(joinpath(options.state_root, ".orchestrator-run"))
  failures = Any[]
  evaluation = Dict{String,Any}[]
  output_lock = ReentrantLock()
  result_lock = ReentrantLock()
- open(options.output, "w") do output
+ flags = Base.JL_O_WRONLY | Base.JL_O_CREAT | Base.JL_O_EXCL
+ fd = ccall(:open, Cint, (Cstring, Cint, Cint), options.output, flags, 0o666)
+ fd >= 0 || throw(SystemError("open coordinator output $(options.output)", Base.Libc.errno()))
+ open(Base.RawFD(fd)) do output
+  output_created[] = true
+  options.mode == "train" && options.reset && reset_training_state!(options)
   for match in schedule
    emit!(output, output_lock, "schedule"; match_id=match.match_id, map=match.map, train_player=match.train_player, seed=string(match.seed), port=match.port, mode=match.mode)
   end
@@ -648,14 +738,15 @@ end
 
 function main(arguments=copy(ARGS))
  output = nothing
+ output_created = Ref(false)
  try
   options = parse_options(arguments)
   output = options.output
-  run_orchestration(options)
+  run_orchestration(options; output_created)
   return 0
  catch error
   line = json_line("orchestration_error"; error=sprint(showerror, error))
-  if output === nothing
+  if output === nothing || !output_created[]
    println(stderr, line)
   else
    try

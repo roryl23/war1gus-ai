@@ -1,13 +1,16 @@
 using Test
+using Sockets
 
 include(joinpath(@__DIR__, "..", "orchestrate.jl"))
 
-function orchestration_args(mode; extras=String[], data_dir=joinpath(tempdir(), "war1gus-data"), matches=8)
+function orchestration_args(mode; extras=String[], data_dir=joinpath(tempdir(), "war1gus-data"), matches=8,
+ launcher=joinpath(tempdir(), "war1gus-launcher"), output=joinpath(tempdir(), "rollouts.jsonl"),
+ state_root=joinpath(tempdir(), "war1gus-state"))
  base = String[
-  mode, "--launcher", joinpath(tempdir(), "war1gus-launcher"), "--data-dir", data_dir,
+  mode, "--launcher", launcher, "--data-dir", data_dir,
   "--matches", string(matches), "--workers", mode == "train" ? "1" : "3",
-  "--timeout-cycles", "12000", "--seed", "73", "--output", joinpath(tempdir(), "rollouts.jsonl"),
-  "--state-root", joinpath(tempdir(), "war1gus-state"), "--rollout-config", joinpath(tempdir(), "rollout.lua"),
+  "--timeout-cycles", "12000", "--seed", "73", "--output", output,
+  "--state-root", state_root, "--rollout-config", joinpath(tempdir(), "rollout.lua"),
  ]
  append!(base, extras)
  return base
@@ -35,6 +38,11 @@ end
  for (mode, selection) in (("train", ["--map", "goldrush"]), ("evaluate", ["--held-out-map", "ice", "--checkpoint", joinpath(tempdir(), "policy")]))
   @test_throws ArgumentError parse_options(orchestration_args(mode; extras=[selection; "--fast-forward"; "--fast-forward"]))
  end
+ @test_throws ArgumentError parse_options(orchestration_args("train"; extras=["--map", "goldrush", "--wall-timeout-seconds", "0"]))
+ @test parse_options(orchestration_args("train"; extras=["--map", "goldrush"])).wall_timeout_seconds ==
+       DEFAULT_WALL_TIMEOUT_SECONDS
+ @test parse_options(orchestration_args("train"; extras=["--map", "goldrush",
+  "--wall-timeout-seconds", "3"])).wall_timeout_seconds == 3
 end
 
 @testset "schedules use each selected map's trainable computer roster" begin
@@ -324,5 +332,92 @@ end
   @test !ispath(checkpoint)
   @test !ispath(league)
   @test ispath(retained_log)
+ end
+end
+
+@testset "host non-ephemeral ports support 1000 matches without changing seed or seat order" begin
+ low, high = linux_ephemeral_port_range()
+ mktempdir() do root
+  map = roster_map(root, "port-schedule", ["computer", "computer", "person"])
+  options = parse_options(orchestration_args("train"; data_dir=root, matches=1000,
+   state_root=joinpath(root, "run-a"), extras=["--map", map]))
+  schedule = build_schedule(options)
+  @test length(unique(match.port for match in schedule)) == 1000
+  @test all(match -> 1024 <= match.port <= 65535 && !(low <= match.port <= high), schedule)
+  other = build_schedule(merge(options, (; state_root=joinpath(root, "run-b"))))
+  @test [(match.match_id, match.map, match.seed, match.train_player) for match in schedule] ==
+        [(match.match_id, match.map, match.seed, match.train_player) for match in other]
+  @test length(match_port_schedule(20_000, root, 32768, 60999)) == 20_000
+  @test_throws ArgumentError match_port_schedule(1000, root, 1024, 65_000)
+ end
+end
+
+@testset "stalled launcher and child are killed, reaped, and recorded" begin
+ mktempdir() do root
+  map = roster_map(root, "stalled", ["computer", "person"])
+  launcher = joinpath(root, "launcher.sh")
+  launcher_pid = joinpath(root, "launcher.pid")
+  child_pid = joinpath(root, "child.pid")
+  write(launcher, "#!/bin/sh\n" *
+                  "echo \$\$ > \"\$LAUNCHER_PID_FILE\"\n" *
+                  "sleep 600 &\n" *
+                  "echo \$! > \"\$CHILD_PID_FILE\"\n" *
+                  "wait\n")
+  chmod(launcher, 0o755)
+  options = parse_options(orchestration_args("train"; data_dir=root, matches=1,
+   launcher, state_root=joinpath(root, "state"),
+   extras=["--map", map, "--wall-timeout-seconds", "3"]))
+  match = only(build_schedule(options))
+  output = IOBuffer()
+  withenv("LAUNCHER_PID_FILE" => launcher_pid, "CHILD_PID_FILE" => child_pid) do
+   @test_throws ErrorException run_one_match(options, match, output, ReentrantLock())
+  end
+  @test isfile(launcher_pid) && isfile(child_pid)
+  events = [child_json_object(line) for line in split(String(take!(output)), '\n') if !isempty(line)]
+  @test [event["type"] for event in events] == ["match_start", "child_timeout"]
+  @test events[2]["timeout_seconds"] == 3
+  @test isfile(match_paths(options, match).child_log)
+  for pid_path in (launcher_pid, child_pid)
+   pid = parse(Int, strip(read(pid_path, String)))
+   stat = "/proc/$pid/stat"
+   # A briefly unreaped orphan can be a zombie; it must not remain runnable.
+   @test timedwait(() -> !isfile(stat) || split(read(stat, String))[3] == "Z", 3; pollint=0.05) == :ok
+  end
+ end
+end
+
+@testset "occupied AI port fails before launch and leaves existing output untouched" begin
+ mktempdir() do root
+  map = roster_map(root, "occupied", ["computer", "person"])
+  launcher = joinpath(root, "launcher.sh")
+  marker = joinpath(root, "started")
+  write(launcher, "#!/bin/sh\nprintf started > \"\$LAUNCH_MARKER\"\n")
+  chmod(launcher, 0o755)
+  options = parse_options(orchestration_args("train"; data_dir=root, matches=1,
+   launcher, state_root=joinpath(root, "state"), output=joinpath(root, "existing.jsonl"),
+   extras=["--map", map]))
+  match = only(build_schedule(options))
+  occupied = listen(ip"0.0.0.0", match.port)
+  output = IOBuffer()
+  try
+   withenv("LAUNCH_MARKER" => marker) do
+    @test_throws ErrorException run_one_match(options, match, output, ReentrantLock())
+   end
+  finally
+   close(occupied)
+  end
+  @test !isfile(marker)
+  events = [child_json_object(line) for line in split(String(take!(output)), '\n') if !isempty(line)]
+  @test [event["type"] for event in events] == ["match_start", "child_failure"]
+  @test occursin("AI port $(match.port) is unavailable", events[2]["error"])
+  previous_log = read(match_paths(options, match).child_log, String)
+  @test_throws Exception run_one_match(options, match, IOBuffer(), ReentrantLock())
+  @test read(match_paths(options, match).child_log, String) == previous_log
+
+  write(options.output, "preserved\n")
+  @test main(orchestration_args("train"; data_dir=root, matches=1,
+   launcher, state_root=joinpath(root, "state"), output=options.output,
+   extras=["--map", map])) == 1
+  @test read(options.output, String) == "preserved\n"
  end
 end

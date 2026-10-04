@@ -200,8 +200,9 @@ without opening an AI connection. Replays execute recorded batches without
 starting Julia. `--train`, `--reset-train`, `--league-train`, and
 `--league-evaluate` retain synchronous decisions and terminal reward delivery.
 The synchronous engine adapter waits for socket readiness instead of sleeping
-between successful protocol stages; reconnect and terminal-delivery deadlines
-remain bounded. This does not enable asynchronous decisions during training.
+between successful protocol stages; a stalled startup/connection has a bounded
+120-second deadline and reports the endpoint on failure. This does not enable
+asynchronous decisions during training.
 For a command-line network lobby with two humans and one AI, pass `ai=1`
 alongside `numplayers=2` in the server's `-G` options.
 
@@ -240,6 +241,23 @@ in its `.sms` setup. Observer and absent seats are never scheduled. Unsupported
 rosters and maps without eligible computer seats fail before checkpoint reset.
 Training must use `--workers 1`, because its checkpoint and league are shared
 mutable state.
+The Linux coordinator reads `/proc/sys/net/ipv4/ip_local_port_range` and assigns
+distinct non-ephemeral AI server ports (up to 20,000 matches). Separate run
+roots spread their ports across the available range without changing map,
+seed, or seat schedules. If the host exposes too few non-ephemeral ports for
+the requested schedule, the run fails before launching matches. The coordinator
+checks each port before launch and records `child_failure` if it is occupied.
+If the server still fails to start or stops responding, synchronous training
+and evaluation requests fail with the AI endpoint in the engine log after at
+most 120 seconds, rather than blocking game cycles indefinitely.
+
+`--wall-timeout-seconds` limits each match's elapsed launcher time, including
+AI startup, to 7200 seconds (two hours) by default. Set a larger value if a
+slow 18000-cycle match needs it. On expiry the coordinator kills the launcher
+process group, including the Julia AI server and other descendants, reaps
+the launcher, emits `child_timeout` with its log path, and continues the
+remaining schedule. Failed matches make the coordinator exit nonzero.
+
 When alternatives exist, training samples each AI seat from a 20% policy and
 80% non-wait exploration mixture. While no hall exists, workers and first-hall
 actions receive eight times the baseline exploration weight. Legal first-hall
@@ -272,7 +290,8 @@ julia --project="$AI_ROOT" "$AI_ROOT/orchestrate.jl" train \
   --data-dir "$WAR1GUS_DATA_DIR" \
   --rollout-config "$AI_ROOT/rollout.lua" \
   --map 'maps/Forest1AI-Observer(3).smp' \
-  --matches 100 --workers 1 --timeout-cycles 18000 --seed 1 \
+  --matches 100 --workers 1 --timeout-cycles 18000 \
+  --wall-timeout-seconds 7200 --seed 1 \
   --state-root "$TRAIN_RUN_DIR" \
   --checkpoint "$AI_ROOT/ai-training/checkpoint.jls" \
   --output "$TRAIN_RUN_DIR/train.jsonl"
@@ -282,8 +301,8 @@ This example intentionally omits `--reset`. That continues the model,
 optimizer, and checkpoint-sibling `league/` state from
 `$AI_ROOT/ai-training`, but it does **not** resume an interrupted coordinator
 schedule or its individual matches. A fresh run directory preserves every
-prior coordinator stream and match log. Reusing a state root and output path
-instead truncates its `train.jsonl` and launcher logs.
+prior coordinator stream and match log. Reusing a run root or output path
+fails instead of truncating existing artifacts; create a new run directory.
 
 Use `--reset` only when intentionally discarding the selected checkpoint and
 league; it requires an explicit `--checkpoint` and removes that checkpoint and
@@ -306,7 +325,8 @@ julia --project="$AI_ROOT" "$AI_ROOT/orchestrate.jl" evaluate \
   --data-dir "$WAR1GUS_DATA_DIR" \
   --rollout-config "$AI_ROOT/rollout.lua" \
   --held-out-map 'maps/GoldRushAI-Max-Observer(5).smp' \
-  --matches 20 --workers 4 --timeout-cycles 18000 --seed 2 \
+  --matches 20 --workers 4 --timeout-cycles 18000 \
+  --wall-timeout-seconds 7200 --seed 2 \
   --state-root "$EVALUATION_RUN_DIR" \
   --checkpoint "$AI_ROOT/ai-training/checkpoint.jls" \
   --output "$EVALUATION_RUN_DIR/evaluate.jsonl"
