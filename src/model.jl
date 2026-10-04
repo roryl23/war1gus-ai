@@ -1447,7 +1447,7 @@ function process_terminal!(
  state::Vector{UInt32};
  validated_state::Bool=false,
 )::Bool
- parse_state(state; terminal=true, validated=validated_state)
+ validated_state || validate_state(state; terminal=true)
  lock(trainer.lock) do
   _rethrow_worker_failure_locked!(trainer)
   session.finalized && return false

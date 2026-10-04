@@ -65,7 +65,14 @@ writes catalog-v9/reward-v4 metadata without resetting learned weights or
 optimizer state. The newly exposed worker signals still need training.
 Batched arithmetic can differ from scalar evaluation by Float32 rounding.
 TCP frames are bulk-decoded, and each selected index is sent in one four-byte
-write with `TCP_NODELAY`.
+write with `TCP_NODELAY`. Terminal messages are validated without materializing
+unused observation records.
+
+Normal-play asynchronous polling skips world snapshots while waiting for or
+discarding a reply. New requests and usable replies still take fresh snapshots
+before selecting or validating actors and targets. The engine's action catalog
+retains its sorted order while borrowing registered identifiers instead of
+copying their strings.
 
 Normal games use deterministic inference from the saved policy. Training uses
 stochastic on-policy PPO with a value head: rewarded trajectories improve the
@@ -343,6 +350,11 @@ policy during an update. `WAR1GUS_AI_VERBOSE_LOG=1` also emits high-frequency
 diagnostics: Julia `network_request`, `network_response`,
 `reward_decomposition`, and complete `training_sample` events, plus Lua reward
 and action records.
+
+The JSONL writer swaps two reusable queue buffers under the queue lock, then
+writes and flushes each batch off-lock before recycling its buffer. Event
+serialization also stays outside that lock; shutdown closes queue admission
+before draining accepted events.
 
 Full `training_sample` records are diagnostics, not a training-data format.
 PPO trains from bounded in-memory trajectory batches; exactly one update may be

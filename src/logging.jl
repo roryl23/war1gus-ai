@@ -142,7 +142,7 @@ function _event_line(type::AbstractString, timestamp::Float64, fields)::String
   end
 end
 
-function _take_event_batch!(logger::EventLogger)::Union{Vector{String},Nothing}
+function _take_event_batch!(logger::EventLogger, spare::Vector{String})::Union{Vector{String},Nothing}
   lock(logger.lock)
   try
     while isempty(logger.queue) && !logger.stopping
@@ -150,7 +150,7 @@ function _take_event_batch!(logger::EventLogger)::Union{Vector{String},Nothing}
     end
     isempty(logger.queue) && return nothing
     batch = logger.queue
-    logger.queue = String[]
+    logger.queue = spare
     return batch
   finally
     unlock(logger.lock)
@@ -179,9 +179,10 @@ function _write_event_lines!(logger::EventLogger)::Nothing
     _report_file_error!(logger, "open", error)
     nothing
   end
+  spare = String[]
   try
     while true
-      batch = _take_event_batch!(logger)
+      batch = _take_event_batch!(logger, spare)
       isnothing(batch) && break
       for line in batch
         if !isnothing(file_io)
@@ -223,6 +224,8 @@ function _write_event_lines!(logger::EventLogger)::Nothing
         catch
         end
       end
+      empty!(batch)
+      spare = batch
     end
   finally
     if !isnothing(file_io)
@@ -312,13 +315,6 @@ function log_event(type::AbstractString; kwargs...)::Nothing
     unlock(EVENT_LOGGER_LOCK)
   end
   isnothing(logger) && return nothing
-  lock(logger.lock)
-  active = try
-    logger.active
-  finally
-    unlock(logger.lock)
-  end
-  active || return nothing
 
   line = _event_line(type, time(), kwargs)
   lock(logger.lock)

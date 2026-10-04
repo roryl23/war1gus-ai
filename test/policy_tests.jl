@@ -641,6 +641,12 @@ end
     live = v3_state(player=9, candidates=Vector{UInt32}[v3_candidate(), v3_candidate(kind=7, actor=1)])
     terminal = v3_state(player=9, candidates=Vector{UInt32}[], terminal_reward=-1_000)
     War1gusAI.process_step!(trainer, session, UInt32(0), Int32(0), live)
+    @test_throws ArgumentError War1gusAI.process_terminal!(trainer, session, UInt32(1), Int32(-1_000), live)
+    @test_throws ArgumentError War1gusAI.process_terminal!(trainer, session, UInt32(1), Int32(-1_000), terminal[1:end-1])
+    @test !session.finalized
+    @test !isnothing(session.previous)
+    @test session.last_sequence == UInt32(0)
+    @test isempty(trainer.pending_fragments)
     @test War1gusAI.process_terminal!(trainer, session, UInt32(1), Int32(-1_000), terminal)
     @test trainer.update_count == 0
     @test length(trainer.pending_fragments) == 1

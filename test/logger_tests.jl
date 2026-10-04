@@ -272,6 +272,33 @@ end
     @isdefined(restart_path) && rm(restart_path; force=true)
   end
 end
+@testset "event logger preserves order across batches" begin
+  War1gusAI.stop_event_logger!()
+  path = tempname()
+  stdout_io = BlockingLoggerIO(Channel{Nothing}(16), Base.Event())
+
+  try
+    War1gusAI.start_event_logger!(path=path, stdout_io=stdout_io, mirror_to_stdout=true)
+    War1gusAI.log_event("ordered"; index=1)
+    @test timedwait(() -> isready(stdout_io.entered), 5.0) == :ok
+    for index in 2:10
+      War1gusAI.log_event("ordered"; index)
+    end
+    notify(stdout_io.release)
+    War1gusAI.stop_event_logger!()
+
+    lines = readlines(path)
+    @test length(lines) == 10
+    @test all(is_json_line, lines)
+    @test all(occursin("\"type\":\"ordered\"", line) &&
+              occursin("\"index\":$index}", line) for (index, line) in enumerate(lines))
+  finally
+    notify(stdout_io.release)
+    War1gusAI.stop_event_logger!()
+    rm(path; force=true)
+  end
+end
+
 
 @testset "configured event log is not mirrored to stdout" begin
   War1gusAI.stop_event_logger!()
