@@ -63,8 +63,12 @@ not a forced order. Other catalog actions remain available without these checks.
 Stratagus revalidates orders at publication; a formerly legal site or affordable
 order can become stale. A rejected publication incurs a bounded training penalty.
 Intermediate selections receive zero immediate reward and later PPO credit.
-The engine suppresses native AI decision managers and unsolicited unit orders
-for `war1gus-ai`; pathfinding and execution of explicit orders still run.
+Native strategic AI managers remain suppressed for `war1gus-ai`, but ordinary
+unit-level combat remains active: idle aggressive mobile units acquire visible
+enemies within reaction range, stand-ground units attack within weapon range,
+and attack orders can reacquire nearby targets. This does not send idle armies
+across the map; the policy must still move them into contact or issue attacks.
+Other unsolicited resource management, wandering, and autocast remain disabled.
 
 Runtime evaluation batches the entity and candidate encoders into reusable
 per-player CPU buffers and projects the shared context once per request. PPO
