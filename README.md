@@ -361,8 +361,15 @@ snapshot instead of sampling the checkpoint's sibling `league/` directory.
 
 ## Rewards and logs
 
-Asset value is each non-wall unit or building's gold-plus-wood cost multiplied
-by remaining-health fraction. Enemy asset loss produces positive progress.
+Enemy progress rewards only actual enemy HP damage credited to this player,
+weighted by the target non-wall unit or building's gold-plus-wood cost divided
+by its maximum HP. The per-player cumulative asset-cost damage counter is
+available as `GetPlayerData(playerIndex, "TotalEnemyAssetDamage")` (in asset-cost
+units, with 1/1024 precision). Progress retains the existing
+`600 / initialEnemyAsset` scale. Other players' damage, shield-only hits, and
+overkill earn no HP-damage progress; a credited lethal hit includes the target's
+remaining HP. Enemy healing or rebuilding no longer subtracts asset progress.
+Older reward books initialize the damage observation when first read.
 Gathering earns +1 per 100 combined gold and wood gathered, measured from
 cumulative player resource counters relative to the first tracked observation;
 the reward is the difference between successive whole-hundred scores, so
