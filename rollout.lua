@@ -57,6 +57,15 @@ local terminal_emitted = false
 local original_stop_game
 local had_opponents = false
 
+local function has_non_wall_units(player)
+  for _, unit in ipairs(GetUnits(player)) do
+    if not GetUnitBoolFlag(unit, "Wall") then
+      return true
+    end
+  end
+  return false
+end
+
 local function write_terminal(outcome)
   local player = rollout_player
   local surviving_total = GetPlayerData(player, "TotalNumUnits")
@@ -114,7 +123,7 @@ CustomStartup = function()
 
     AddTrigger(
       function()
-        return not terminal_emitted and GetPlayerData(rollout_player, "TotalNumUnits") == 0
+        return not terminal_emitted and not has_non_wall_units(rollout_player)
       end,
       function()
         return finish("loss")

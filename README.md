@@ -259,6 +259,13 @@ in its `.sms` setup. Observer and absent seats are never scheduled. Unsupported
 rosters and maps without eligible computer seats fail before checkpoint reset.
 Training must use `--workers 1`, because its checkpoint and league are shared
 mutable state.
+
+Rollout loss and the AI's defeat reward use the same survival rule as engine
+opponent counts: a player with no non-wall units is defeated even if owned walls
+remain. A player still owning a non-wall unit is not eliminated by this rule.
+After an opponent has been observed, eliminating all its non-wall units wins;
+otherwise a surviving match reaches its configured cycle timeout.
+
 The Linux coordinator reads `/proc/sys/net/ipv4/ip_local_port_range` and assigns
 distinct non-ephemeral AI server ports (up to 20,000 matches). Separate run
 roots spread their ports across the available range without changing map,
