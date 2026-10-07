@@ -35,20 +35,34 @@ reuse the 14-word entity record without changing protocol width.
 
 The engine derives build, train, upgrade, research, and spell choices from its
 registered producer and caster definitions. Lua offers movement, combat,
-transport, stop, hold, and cancellation orders to every owned actor. Harvesting
-choices are restricted to peasants and peons: `resource-location` targets forest
-tiles containing trees, while `resource` targets live gold mine entities. Other
-position actions retain normal map coordinates.
-Except for the first town hall, choices are not masked by affordability,
-dependencies, supply, idle state, construction counts, or road placement. With
-no hall, its build-site coordinates are limited to sites `AiCanBuildAt` reports
-legal; an accepted locally preferred first-hall order reserves only that builder
-until the hall finishes, the order aborts, or a bounded timeout expires.
-Other actors remain available. Stratagus revalidates every published order.
-Awareness of a worker's activity does not prevent stochastic training choices
-from interrupting its order.
-A rejected publication incurs a bounded training penalty. Intermediate
-selections receive zero immediate reward and later PPO credit.
+transport, stop, hold, and cancellation orders to selectable owned actors.
+Buildings under construction or training remain observations but are not
+selectable actors: stop/cancel orders would discard the first hall or interrupt
+troop production. Harvesting choices are restricted to peasants and peons:
+`resource-location` targets forest tiles containing trees, while `resource`
+targets live gold mine entities. Return-goods targets are filtered by the
+worker's carried resource: a depot must store that resource, rather than merely
+being a friendly building.
+When a compatible depot is available, a worker carrying goods on a resource
+order is left to deposit them; a loaded worker whose resource order stopped is
+offered only return-goods. The last active harvester is also protected once a
+depot is complete. Additional empty-handed harvesters can still build; idle
+workers and resource orders receive a soft exploration preference when fewer
+than two workers are harvesting. Other position actions retain normal map
+coordinates.
+Build-site coordinates for every building, including the first town hall, are
+limited to sites `AiCanBuildAt` reports legal during staged target selection.
+With no hall, an accepted locally preferred first-hall order reserves only
+that builder until the hall finishes, the order aborts, or a bounded timeout
+expires. Other selectable actors remain available. Busy actors are not offered
+build/train catalog choices except that a worker harvesting resources may
+build. Build/train choices require current dependencies, affordability, supply,
+and unit limits; the same engine eligibility checks run again before publication.
+Available combat training and its idle producer receive an exploration preference,
+not a forced order. Other catalog actions remain available without these checks.
+Stratagus revalidates orders at publication; a formerly legal site or affordable
+order can become stale. A rejected publication incurs a bounded training penalty.
+Intermediate selections receive zero immediate reward and later PPO credit.
 The engine suppresses native AI decision managers and unsolicited unit orders
 for `war1gus-ai`; pathfinding and execution of explicit orders still run.
 
