@@ -15,8 +15,8 @@ function parse_options(arguments::Vector{String})
  mode in ("train", "evaluate") || throw(ArgumentError("mode must be train or evaluate"))
  values = Dict{Symbol,Any}(
   :maps => String[], :held_out_maps => String[], :reset => false, :fast_forward => false,
-  :checkpoint => nothing, :league_snapshot => nothing,
-  :wall_timeout_seconds => DEFAULT_WALL_TIMEOUT_SECONDS,
+  :training_mixture => false, :checkpoint => nothing, :league_snapshot => nothing,
+  :schedule => nothing, :wall_timeout_seconds => DEFAULT_WALL_TIMEOUT_SECONDS,
  )
  option_names = Dict(
   "--launcher" => :launcher, "--data-dir" => :data_dir, "--matches" => :matches,
@@ -24,7 +24,7 @@ function parse_options(arguments::Vector{String})
   "--wall-timeout-seconds" => :wall_timeout_seconds,
   "--output" => :output, "--state-root" => :state_root,
   "--checkpoint" => :checkpoint, "--league-snapshot" => :league_snapshot,
-  "--rollout-config" => :rollout_config,
+  "--rollout-config" => :rollout_config, "--schedule" => :schedule,
  )
  specified = Set{Symbol}()
  index = 2
@@ -35,8 +35,8 @@ function parse_options(arguments::Vector{String})
    target = argument == "--map" ? :maps : :held_out_maps
    push!(values[target], arguments[index+1])
    index += 2
-  elseif argument == "--reset" || argument == "--fast-forward"
-   key = argument == "--reset" ? :reset : :fast_forward
+  elseif argument in ("--reset", "--fast-forward", "--training-mixture")
+   key = Symbol(replace(argument[3:end], '-' => '_'))
    values[key] && throw(ArgumentError("$argument may be supplied once"))
    values[key] = true
    index += 1
@@ -60,7 +60,7 @@ function parse_options(arguments::Vector{String})
   value isa AbstractString && !isempty(value) || value isa Integer ||
    throw(ArgumentError("--$(replace(String(key), '_' => '-')) must not be empty"))
  end
- for key in (:checkpoint, :league_snapshot)
+ for key in (:checkpoint, :league_snapshot, :schedule)
   values[key] === nothing || !isempty(values[key]) ||
    throw(ArgumentError("--$(replace(String(key), '_' => '-')) must not be empty"))
  end
@@ -73,6 +73,7 @@ function parse_options(arguments::Vector{String})
  all(value -> !isempty(value), values[:maps]) || throw(ArgumentError("--map must not be empty"))
  all(value -> !isempty(value), values[:held_out_maps]) || throw(ArgumentError("--held-out-map must not be empty"))
  if mode == "train"
+  values[:training_mixture] && throw(ArgumentError("--training-mixture is evaluate-only"))
   isempty(values[:maps]) && throw(ArgumentError("train requires at least one --map"))
   values[:reset] && values[:checkpoint] === nothing &&
    throw(ArgumentError("train --reset requires an explicit --checkpoint"))
@@ -87,8 +88,9 @@ function parse_options(arguments::Vector{String})
   timeout_cycles=values[:timeout_cycles], wall_timeout_seconds=values[:wall_timeout_seconds],
   seed=values[:seed], output=values[:output],
   state_root=values[:state_root], checkpoint=values[:checkpoint],
-  league_snapshot=values[:league_snapshot], reset=values[:reset],
-  fast_forward=values[:fast_forward], rollout_config=values[:rollout_config])
+  league_snapshot=values[:league_snapshot], schedule=values[:schedule], reset=values[:reset],
+  fast_forward=values[:fast_forward], training_mixture=values[:training_mixture],
+  rollout_config=values[:rollout_config])
 end
 
 """Read the selected map's literal player roster; never execute map Lua to discover seats."""
@@ -161,6 +163,41 @@ function linux_ephemeral_port_range()
  return parse(Int, fields[1]), parse(Int, fields[2])
 end
 
+"""Read an explicit schedule in file order, rejecting malformed or ineligible rows."""
+function read_explicit_schedule(options, maps, eligible_seats)
+ path = options.schedule
+ isfile(path) || throw(ArgumentError("--schedule must name a file: $path"))
+ text = read(path, String)
+ isvalid(text) || throw(ArgumentError("--schedule must be UTF-8: $path"))
+ lines = split(text, '\n'; keepempty=true)
+ !isempty(lines) && isempty(last(lines)) && pop!(lines)
+ !isempty(lines) && first(lines) == "map\ttrain_player\tseed" ||
+  throw(ArgumentError("--schedule requires header map<TAB>train_player<TAB>seed"))
+ length(lines) - 1 == options.matches ||
+  throw(ArgumentError("--schedule row count must equal --matches ($(options.matches))"))
+ rows = NamedTuple[]
+ seeds = Set{Int}()
+ for (line_number, line) in enumerate(@view lines[2:end])
+  fields = split(line, '\t'; keepempty=true)
+  length(fields) == 3 || throw(ArgumentError("--schedule line $(line_number + 1) must have three TSV columns"))
+  map_index = findfirst(==(fields[1]), maps)
+  map_index === nothing && throw(ArgumentError("--schedule line $(line_number + 1) has an unselected map"))
+  occursin(r"^(0|[1-9][0-9]*)$", fields[2]) ||
+   throw(ArgumentError("--schedule line $(line_number + 1) has an invalid train_player"))
+  seat = tryparse(Int, fields[2])
+  seat !== nothing && seat in eligible_seats[map_index] ||
+   throw(ArgumentError("--schedule line $(line_number + 1) has an ineligible train_player"))
+  occursin(r"^[1-9][0-9]*$", fields[3]) ||
+   throw(ArgumentError("--schedule line $(line_number + 1) has an invalid seed"))
+  seed = tryparse(Int32, fields[3])
+  seed === nothing && throw(ArgumentError("--schedule line $(line_number + 1) seed exceeds positive Int32"))
+  Int(seed) in seeds && throw(ArgumentError("--schedule line $(line_number + 1) repeats a seed"))
+  push!(seeds, Int(seed))
+  push!(rows, (; map=String(fields[1]), train_player=seat, seed=Int(seed)))
+ end
+ return rows
+end
+
 """Construct a reproducible, precomputed match schedule so worker ordering cannot affect it."""
 function build_schedule(options)
  ephemeral_low, ephemeral_high = linux_ephemeral_port_range()
@@ -168,23 +205,29 @@ function build_schedule(options)
  rng = MersenneTwister(options.seed)
  maps = options.mode == "train" ? options.maps : options.held_out_maps
  eligible_seats = [map_trainable_seats(options, map) for map in maps]
+ explicit_rows = options.schedule === nothing ? nothing : read_explicit_schedule(options, maps, eligible_seats)
  map_order = options.mode == "train" ? shuffle(rng, collect(eachindex(maps))) : Int[]
  seat_orders = options.mode == "train" ? [shuffle(rng, seats) for seats in eligible_seats] : Vector{Int}[]
  seat_counts = zeros(Int, length(maps))
  schedule = NamedTuple[]
  child_seeds = Set{Int}()
  for ordinal in 1:options.matches
-  map_index = options.mode == "train" ? map_order[mod1(ordinal, length(map_order))] : rand(rng, eachindex(maps))
-  map = maps[map_index]
-  seat_counts[map_index] += 1
-  seats = options.mode == "train" ? seat_orders[map_index] : eligible_seats[map_index]
-  seat = options.mode == "train" ? seats[mod1(seat_counts[map_index], length(seats))] :
-         seats[Int(mod(UInt(options.seed), UInt(length(seats))))+1]
-  child_seed = rand(rng, 1:typemax(Int32))
-  while child_seed in child_seeds
+  if explicit_rows === nothing
+   map_index = options.mode == "train" ? map_order[mod1(ordinal, length(map_order))] : rand(rng, eachindex(maps))
+   map = maps[map_index]
+   seat_counts[map_index] += 1
+   seats = options.mode == "train" ? seat_orders[map_index] : eligible_seats[map_index]
+   seat = options.mode == "train" ? seats[mod1(seat_counts[map_index], length(seats))] :
+          seats[Int(mod(UInt(options.seed), UInt(length(seats))))+1]
    child_seed = rand(rng, 1:typemax(Int32))
+   while child_seed in child_seeds
+    child_seed = rand(rng, 1:typemax(Int32))
+   end
+   push!(child_seeds, child_seed)
+  else
+   row = explicit_rows[ordinal]
+   map, seat, child_seed = row.map, row.train_player, row.seed
   end
-  push!(child_seeds, child_seed)
   match_id = string(options.mode, "-", lpad(ordinal, 6, '0'), "-", string(child_seed, base=16))
   port = ports[ordinal]
   push!(schedule, (; ordinal, map, train_player=seat, seed=child_seed, port,
@@ -255,6 +298,7 @@ function build_match_command(options, match)
  if options.mode == "evaluate"
   environment["WAR1GUS_AI_READ_ONLY"] = "1"
  end
+ environment["WAR1GUS_AI_EVAL_TRAINING_MIXTURE"] = options.training_mixture ? "1" : "0"
  return Cmd(command), environment, paths
 end
 
@@ -429,6 +473,7 @@ end
 const TERMINAL_NUMERIC_FIELDS = (
  "trainable_player", "seed", "cycles", "kills", "razings", "gold", "wood",
  "units", "buildings", "total_units", "total_buildings",
+ "produced_units", "completed_buildings", "lost_units", "lost_buildings",
 )
 
 function collect_events_of_type(lines, event_type::AbstractString)
@@ -497,7 +542,7 @@ function outcome_for(record)
  return "draw"
 end
 
-"""Aggregate rollout terminal records into evaluation metrics with zero-safe proxies."""
+"""Aggregate rollout terminal records into evaluation metrics with zero-safe efficiencies."""
 function aggregate_evaluation(records::AbstractVector)
  matches = length(records)
  wins = 0
@@ -524,10 +569,8 @@ function aggregate_evaluation(records::AbstractVector)
   outcome == "win" && (win_cycles += match_cycles)
   kills += number_field(record, "kills")
   razings += number_field(record, "razings")
-  produced = number_field(record, "total_units") + number_field(record, "total_buildings")
-  survived = number_field(record, "units") + number_field(record, "buildings")
-  total_production += produced
-  own_losses += max(produced - survived, 0.0)
+  total_production += number_field(record, "produced_units") + number_field(record, "completed_buildings")
+  own_losses += number_field(record, "lost_units") + number_field(record, "lost_buildings")
   gold += number_field(record, "gold")
   wood += number_field(record, "wood")
   map = string(get(record, "map", "unknown"))
@@ -542,7 +585,7 @@ function aggregate_evaluation(records::AbstractVector)
   "mean_cycles" => matches == 0 ? 0.0 : cycles / matches,
   "mean_elimination_time" => wins == 0 ? 0.0 : win_cycles / wins,
   "destroyed_assets" => destroyed_assets,
-  "own_loss_proxy" => own_losses,
+  "own_losses" => own_losses,
   "total_production" => total_production,
   "asset_efficiency" => own_losses == 0 ? 0.0 : destroyed_assets / own_losses,
   "combat_efficiency" => own_losses == 0 ? 0.0 : kills / own_losses,
@@ -703,7 +746,7 @@ function run_orchestration(options; output_created=Ref(false))
   output_created[] = true
   options.mode == "train" && options.reset && reset_training_state!(options)
   for match in schedule
-   emit!(output, output_lock, "schedule"; match_id=match.match_id, map=match.map, train_player=match.train_player, seed=string(match.seed), port=match.port, mode=match.mode)
+   emit!(output, output_lock, "schedule"; match_id=match.match_id, map=match.map, train_player=match.train_player, seed=string(match.seed), port=match.port, mode=match.mode, action_selection=options.mode == "evaluate" ? (options.training_mixture ? "training_mixture" : "greedy") : "training_mixture")
   end
   queue = Channel{Any}(length(schedule))
   foreach(match -> put!(queue, match), schedule)
@@ -728,7 +771,7 @@ function run_orchestration(options; output_created=Ref(false))
   foreach(wait, workers)
   if options.mode == "evaluate"
    metrics = aggregate_evaluation(evaluation)
-   emit!(output, output_lock, "evaluation_aggregate"; metrics=metrics)
+   emit!(output, output_lock, "evaluation_aggregate"; metrics=metrics, action_selection=options.training_mixture ? "training_mixture" : "greedy")
   end
   emit!(output, output_lock, "orchestration_complete"; mode=options.mode, matches=length(schedule), failures=length(failures))
  end

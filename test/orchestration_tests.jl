@@ -35,6 +35,8 @@ end
  @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice"]))
  @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice", "--league-snapshot", joinpath(tempdir(), "frozen-opponent")]))
  @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice", "--checkpoint", joinpath(tempdir(), "policy"), "--reset"]))
+ @test_throws ArgumentError parse_options(orchestration_args("train"; extras=["--map", "goldrush", "--training-mixture"]))
+ @test_throws ArgumentError parse_options(orchestration_args("evaluate"; extras=["--held-out-map", "ice", "--checkpoint", "policy", "--training-mixture", "--training-mixture"]))
  for (mode, selection) in (("train", ["--map", "goldrush"]), ("evaluate", ["--held-out-map", "ice", "--checkpoint", joinpath(tempdir(), "policy")]))
   @test_throws ArgumentError parse_options(orchestration_args(mode; extras=[selection; "--fast-forward"; "--fast-forward"]))
  end
@@ -94,6 +96,12 @@ end
   @test all(match -> match.map == mixed ? match.train_player in (1, 3) :
                      match.train_player == 1, evaluation_schedule)
   @test all(match -> match.mode == "evaluate", evaluation_schedule)
+  mixture = parse_options(orchestration_args("evaluate"; data_dir,
+   extras=["--map", duel, "--held-out-map", mixed, "--held-out-map", other_ai,
+    "--checkpoint", joinpath(tempdir(), "policy"), "--training-mixture"]))
+  @test mixture.training_mixture
+  @test !evaluate.training_mixture
+  @test build_schedule(mixture) == evaluation_schedule
 
   no_computer = roster_map(data_dir, "spectators", ["person", "person"])
   unsupported = roster_map(data_dir, "unsupported", ["computer", "person"];
@@ -111,6 +119,59 @@ end
  end
 end
 
+@testset "explicit TSV schedules preserve maps, seats, and child seeds" begin
+ mktempdir() do root
+  duel = roster_map(root, "duel", ["computer", "computer", "person"];
+   ai_types=Dict(0 => "war1gus-ai", 1 => "war1gus-ai"))
+  other = roster_map(root, "other", ["computer", "computer", "person"];
+   ai_types=Dict(0 => "wc1-land-attack", 1 => "war1gus-ai"))
+  schedule_path = joinpath(root, "schedule.tsv")
+  header = "map\ttrain_player\tseed\n"
+  rows = "$duel\t0\t902001\n$other\t1\t2147483647\n$duel\t1\t902003\n"
+  write(schedule_path, header * rows)
+  for mode in ("train", "evaluate")
+   map_flag = mode == "train" ? "--map" : "--held-out-map"
+   selection = [map_flag, duel, map_flag, other]
+   mode == "evaluate" && append!(selection, ["--checkpoint", joinpath(root, "policy.jls")])
+   options = parse_options(orchestration_args(mode; data_dir=root, matches=3,
+    state_root=joinpath(root, "run"), extras=[selection; "--schedule"; schedule_path]))
+   actual = build_schedule(options)
+   @test [(match.map, match.train_player, match.seed) for match in actual] ==
+         [(duel, 0, 902001), (other, 1, typemax(Int32)), (duel, 1, 902003)]
+   @test [match.ordinal for match in actual] == 1:3
+   @test all(match -> startswith(match.match_id, "$mode-"), actual)
+   @test length(unique(match.port for match in actual)) == 3
+   @test [(match.map, match.train_player, match.seed, match.match_id, match.port) for match in actual] ==
+         [(match.map, match.train_player, match.seed, match.match_id, match.port)
+          for match in build_schedule(options)]
+   alternate_checkpoint = merge(options, (; checkpoint=joinpath(root, "another-policy.jls"), seed=9876))
+   @test [(match.map, match.train_player, match.seed, match.match_id, match.port) for match in actual] ==
+         [(match.map, match.train_player, match.seed, match.match_id, match.port)
+          for match in build_schedule(alternate_checkpoint)]
+   for invalid in (
+    "map\tseat\tseed\n" * rows,
+    header * "$duel\t0\t902001\n",
+    header * rows * "$duel\t0\t2\n",
+    header * "$duel\t0\t902001\n$other\t0\t902002\n$duel\t1\t902003\n",
+    header * "$duel\t0\t902001\nmaps/missing.smp\t1\t902002\n$duel\t1\t902003\n",
+    header * "$duel\t0\t902001\n$other\t1\t902001\n$duel\t1\t902003\n",
+    header * "$duel\t0\t0\n$other\t1\t902002\n$duel\t1\t902003\n",
+    header * "$duel\t0\t2147483648\n$other\t1\t902002\n$duel\t1\t902003\n",
+    header * "$duel\t-1\t902001\n$other\t1\t902002\n$duel\t1\t902003\n",
+    header * "$duel\t0\t902001\textra\n$other\t1\t902002\n$duel\t1\t902003\n",
+    header * "$duel\t0\t902001\n\n$duel\t1\t902003\n",
+   )
+    write(schedule_path, invalid)
+    @test_throws ArgumentError build_schedule(options)
+   end
+   write(schedule_path, header * rows)
+   rm(schedule_path)
+   @test_throws ArgumentError build_schedule(options)
+   write(schedule_path, header * rows)
+  end
+ end
+end
+
 @testset "repository observer maps never schedule their observer" begin
  source_dir = normpath(joinpath(@__DIR__, "..", "..", "..", ".."))
  duel = joinpath("maps", "Forest1AI-Observer(3).smp")
@@ -119,7 +180,7 @@ end
  @test sort([match.train_player for match in build_schedule(source_options)]) == [0, 0, 1, 1]
 
  for name in ("Forest1AI-Observer(5).smp", "Forest1AI-2x-Max-Observer(5).smp",
-  "GoldRushAI-Max-Observer(5).smp")
+  "GoldRushAI-Max-Observer(5).smp", "4-middle-ground-AI-Observer(5).smp")
   map = joinpath("maps", name)
   options = parse_options(orchestration_args("train"; data_dir=source_dir, matches=4,
    extras=["--map", map]))
@@ -129,9 +190,9 @@ end
 
 @testset "evaluation aggregate reports outcomes and zero-safe efficiencies" begin
  metrics = aggregate_evaluation([
-  Dict("map" => "ice", "outcome" => "win", "cycles" => 100, "units" => 4, "buildings" => 1, "total_units" => 7, "total_buildings" => 2, "kills" => 6, "razings" => 2, "gold" => 500, "wood" => 200),
-  Dict("map" => "ice", "outcome" => "loss", "cycles" => 200, "units" => 2, "buildings" => 3, "total_units" => 4, "total_buildings" => 6, "kills" => 1, "razings" => 3, "gold" => 300, "wood" => 400),
-  Dict("map" => "island", "outcome" => "timeout", "cycles" => 300),
+  Dict("map" => "ice", "outcome" => "win", "cycles" => 100, "units" => 4, "buildings" => 1, "total_units" => 70, "total_buildings" => 20, "produced_units" => 4, "completed_buildings" => 2, "lost_units" => 1, "lost_buildings" => 1, "kills" => 6, "razings" => 2, "gold" => 500, "wood" => 200),
+  Dict("map" => "ice", "outcome" => "loss", "cycles" => 200, "units" => 2, "buildings" => 3, "total_units" => 40, "total_buildings" => 60, "produced_units" => 3, "completed_buildings" => 1, "lost_units" => 2, "lost_buildings" => 1, "kills" => 1, "razings" => 3, "gold" => 300, "wood" => 400),
+  Dict("map" => "island", "outcome" => "timeout", "cycles" => 300, "produced_units" => 0, "completed_buildings" => 0, "lost_units" => 0, "lost_buildings" => 0),
  ])
  @test metrics["matches"] == 3
  @test (metrics["wins"], metrics["losses"], metrics["draws"], metrics["timeouts"]) == (1, 1, 0, 1)
@@ -139,10 +200,11 @@ end
  @test metrics["mean_cycles"] == 200.0
  @test metrics["mean_elimination_time"] == 100.0
  @test metrics["destroyed_assets"] == 12.0
- @test metrics["own_loss_proxy"] == 9.0
- @test metrics["total_production"] == 19.0
- @test metrics["asset_efficiency"] == 4 / 3
- @test metrics["combat_efficiency"] == 7 / 9
+ @test metrics["own_losses"] == 5.0
+ @test !haskey(metrics, "own_loss_proxy")
+ @test metrics["total_production"] == 10.0
+ @test metrics["asset_efficiency"] == 12 / 5
+ @test metrics["combat_efficiency"] == 7 / 5
  @test (metrics["total_gold"], metrics["total_wood"]) == (800.0, 600.0)
  @test metrics["per_map"]["ice"]["wins"] == 1
  @test aggregate_evaluation(Dict{String,Any}[])["combat_efficiency"] == 0.0
@@ -166,6 +228,10 @@ end
   buildings=2,
   total_units=7,
   total_buildings=3,
+  produced_units=3,
+  completed_buildings=1,
+  lost_units=2,
+  lost_buildings=0,
   outcome="win",
  )
  large_diagnostic_line = json_line("training_sample"; payload=repeat("diagnostic", 10_000))
@@ -201,6 +267,11 @@ end
   events = collect_result_events(paths)
   @test [event["type"] for event in events] == ["rollout_terminal"]
   @test require_rollout_terminal(events, match)["outcome"] == "win"
+  for field in ("produced_units", "completed_buildings", "lost_units", "lost_buildings")
+   without_field = copy(only(events))
+   delete!(without_field, field)
+   @test_throws ArgumentError require_rollout_terminal([without_field], match)
+  end
   @test_throws ArgumentError require_rollout_terminal(Dict{String,Any}[], match)
 
   write_log(paths.ai_log, [large_diagnostic_line, terminal_line, fatal_line])
@@ -301,6 +372,23 @@ end
   @test !in("--reset-train", evaluation_command.exec)
   @test "-b" in evaluation_command.exec
   @test evaluation_environment["WAR1GUS_AI_READ_ONLY"] == "1"
+  @test !evaluate.training_mixture
+  @test evaluation_environment["WAR1GUS_AI_EVAL_TRAINING_MIXTURE"] == "0"
+  @test first_environment["WAR1GUS_AI_EVAL_TRAINING_MIXTURE"] == "0"
+  mixture = parse_options(orchestration_args("evaluate"; data_dir, extras=["--held-out-map", held_out,
+   "--checkpoint", frozen_policy, "--league-snapshot", frozen_snapshot, "--training-mixture"]))
+  @test build_schedule(mixture) == build_schedule(evaluate)
+  mixture_command, mixture_environment, _ = build_match_command(mixture, first(build_schedule(mixture)))
+  @test mixture_command.exec == evaluation_command.exec
+  @test mixture_environment["WAR1GUS_AI_READ_ONLY"] == "1"
+  @test mixture_environment["WAR1GUS_AI_EVAL_TRAINING_MIXTURE"] == "1"
+  @test mixture_environment["WAR1GUS_AI_CHECKPOINT"] == evaluation_environment["WAR1GUS_AI_CHECKPOINT"]
+  @test mixture_environment["WAR1GUS_AI_SNAPSHOT"] == evaluation_environment["WAR1GUS_AI_SNAPSHOT"]
+  withenv("WAR1GUS_AI_EVAL_TRAINING_MIXTURE" => "1") do
+   @test child_environment(first_environment)["WAR1GUS_AI_EVAL_TRAINING_MIXTURE"] == "0"
+   @test child_environment(evaluation_environment)["WAR1GUS_AI_EVAL_TRAINING_MIXTURE"] == "0"
+   @test child_environment(mixture_environment)["WAR1GUS_AI_EVAL_TRAINING_MIXTURE"] == "1"
+  end
   @test evaluation_environment["WAR1GUS_AI_CHECKPOINT"] == frozen_policy
   @test evaluation_environment["WAR1GUS_AI_SNAPSHOT"] == frozen_snapshot
   @test evaluation_environment["WAR1GUS_AI_LEAGUE_DIR"] == joinpath(dirname(frozen_policy), "league")

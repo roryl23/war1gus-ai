@@ -803,6 +803,7 @@ mutable struct OnlineTrainer{O,R<:AbstractRNG,D}
  checkpoint_lock::ReentrantLock
  mode::Symbol
  read_only::Bool
+ eval_training_mixture::Bool
  training_device::D
  training_backend::Symbol
  gamma::Float32
@@ -1037,6 +1038,8 @@ function create_trainer(
  0.0 < clip_epsilon < 1.0 || throw(ArgumentError("PPO clipping epsilon must be in (0, 1)"))
  value_coefficient >= 0 || throw(ArgumentError("value coefficient must not be negative"))
  entropy_coefficient >= 0 || throw(ArgumentError("entropy coefficient must not be negative"))
+ eval_training_mixture = mode == MODE_LEAGUE_EVALUATE &&
+                         strip(get(ENV, "WAR1GUS_AI_EVAL_TRAINING_MIXTURE", "")) == "1"
 
  selected_policy = if isnothing(policy)
   create_policy(seed=seed)
@@ -1064,6 +1067,7 @@ function create_trainer(
  )
  trainer = OnlineTrainer(
   selected_policy, restored.optimizer_state, ReentrantLock(), ReentrantLock(), mode, read_only,
+  eval_training_mixture,
   selected_device, selected_backend, Float32(gamma), Float32(gae_lambda), Float32(clip_epsilon), Float32(value_coefficient),
   Float32(entropy_coefficient), restored.update_count, 0, selected_path, Int(batch_size),
   Int(rollout_fragment), Int(ppo_epochs), Int(checkpoint_every), TrajectoryFragment[], false,
@@ -1086,6 +1090,7 @@ function create_trainer(
    directory=selected_league_path,
    snapshot_override=selected_override,
    read_only,
+   action_selection=is_training(trainer) || eval_training_mixture ? "training_mixture" : "greedy",
   )
  end
  log_event("trainer_seed"; seed=Int(seed), mode=String(mode), train_player=Int(train_player), read_only)
@@ -1420,7 +1425,7 @@ function process_step!(
    _log_reward_decomposition(state, sequence, reward, false)
   end
 
-  if is_training(trainer)
+  if is_training(trainer) || trainer.eval_training_mixture
    log_probabilities = training_action_log_probabilities(scores, observation.candidates)
    action = _sample_from_log_probabilities(log_probabilities, trainer.rng)
    log_probability = log_probabilities[action+1]

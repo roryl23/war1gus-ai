@@ -252,8 +252,8 @@ engine. Neither mode changes game type, diplomacy, random seeds, or simulation
 steps.
 
 Each match trains one mutable policy seat and samples frozen opponents from a
-bounded snapshot league. Map and child-seed schedules are reproducible. Each
-map rotates through its own shuffled computer-seat roster from the `.smp`
+bounded snapshot league. Default map and child-seed schedules are reproducible.
+Each map rotates through its own shuffled computer-seat roster from the `.smp`
 `DefinePlayerTypes` declaration, excluding explicit non-`war1gus-ai` assignments
 in its `.sms` setup. Observer and absent seats are never scheduled. Unsupported
 rosters and maps without eligible computer seats fail before checkpoint reset.
@@ -297,7 +297,10 @@ sampling mixture. Inference and league evaluation remain greedy.
 The coordinator also refreshes those files in `--data-dir` before validating
 selected maps or resetting a checkpoint. Direct training and evaluation runs
 therefore do not require a separate build solely to sync changed scripts or
-maps. This step requires CMake and an extracted `war1data` directory.
+maps. This step requires CMake and an extracted `war1data` directory. Because
+the sync writes into `--data-dir`, use a private copy of the extracted data for
+controlled comparisons; evaluation is read-only for checkpoint/opponent state,
+not for its runtime data directory.
 
 Set the War1gus data directory for your installation, then start a fresh
 coordinator run with the Forest observer map. The checkpoint and its sibling
@@ -335,36 +338,99 @@ its sibling `league/` directory.
 
 ## Evaluation
 
-Evaluation is read-only. Use a map excluded from the training schedule and the
-immutable training checkpoint. It reports per-map outcomes, win rate,
-elimination time, production, resource totals, and combat/asset-efficiency
-proxies as JSON Lines. The example creates a fresh unique `<run-id>` directory
-under `ai-evaluation/runs/` for its state and output.
+Evaluation does not update the selected checkpoint or opponent snapshot. Pin
+**both** `--checkpoint` and `--league-snapshot` to immutable files for a
+controlled comparison; the snapshot prevents league drift. Supply a private
+copy of extracted `war1data` as `--data-dir`, not the original installation:
+the coordinator synchronizes source-owned runtime scripts and maps there.
+Use a fresh copy and run directory for each checkpoint or variant. Evaluation
+reports per-map outcomes, win rate, elimination time, exact production and loss
+counts, resource totals, and combat/asset efficiencies in its JSON Lines output.
+
+By default, evaluation uses the policy's greedy action, not training's 80%
+exploration mixture. A map with preplaced workers and town halls can still
+remain idle when the policy ranks `wait` first; that is a deployable-policy
+failure, not a reason to count exploratory training wins as held-out wins.
+Add `--training-mixture` to `orchestrate.jl evaluate` only for a **read-only
+exploratory diagnostic**: both the evaluated player and frozen opponents use
+the same 80% training-mixture sampler (sampling non-wait actions 80% of the
+time). It never trains or writes a checkpoint or snapshot. Its outcomes are
+not evidence of a learned deterministic/deployment policy. Coordinator
+schedule records and evaluation aggregates label `action_selection` as
+`training_mixture` or `greedy`; compare results only within the same mode.
+
+For matched comparisons, write a UTF-8 TSV schedule with an exact
+`map<TAB>train_player<TAB>seed` header (literal tab separators) and one row per
+match in launch order. Map names must exactly match a selected `--held-out-map`
+(for training, a selected `--map`); seats must be eligible computer seats on
+that map, and seeds must be distinct positive Int32 integers. There must be
+exactly `--matches` rows. `--schedule FILE` works with both `evaluate` and
+`train`; generated scheduling remains the default when it is omitted.
+`--seed` remains required for the CLI but does not affect an explicit schedule.
+The same schedule and run-root path generate the same match IDs, child seeds,
+map/seat assignments, and ports regardless of checkpoint or worker order.
+Use fresh, distinct run roots in practice; root-dependent ports may then differ.
+
+This example covers all four trainable seats of a held-out observer map.
+Choose the same schedule, opponent file, cycle limit, launcher, and runtime
+version for each checkpoint being compared:
 
 ```sh
+WAR1GUS_DATA_DIR="$HOME/.local/share/stratagus/data.War1gus"
+: "${EVAL_CHECKPOINT:?Set EVAL_CHECKPOINT to an immutable checkpoint copy}"
+: "${EVAL_OPPONENT:?Set EVAL_OPPONENT to an immutable opponent snapshot}"
 mkdir -p "$AI_ROOT/ai-evaluation/runs"
 EVALUATION_RUN_DIR="$(mktemp -d "$AI_ROOT/ai-evaluation/runs/$(date -u +%Y%m%dT%H%M%S)-XXXXXX")"
+cp -a "$WAR1GUS_DATA_DIR" "$EVALUATION_RUN_DIR/data"
+printf 'map\ttrain_player\tseed\n%s\t0\t904001\n%s\t1\t904002\n%s\t2\t904003\n%s\t3\t904004\n%s\t0\t904101\n%s\t1\t904102\n%s\t2\t904103\n%s\t3\t904104\n' \
+  'maps/4-middle-ground-AI-Observer(5).smp' \
+  'maps/4-middle-ground-AI-Observer(5).smp' \
+  'maps/4-middle-ground-AI-Observer(5).smp' \
+  'maps/4-middle-ground-AI-Observer(5).smp' \
+  'maps/4-middle-ground-AI-Observer(5).smp' \
+  'maps/4-middle-ground-AI-Observer(5).smp' \
+  'maps/4-middle-ground-AI-Observer(5).smp' \
+  'maps/4-middle-ground-AI-Observer(5).smp' > "$EVALUATION_RUN_DIR/schedule.tsv"
 
-julia --project="$AI_ROOT" "$AI_ROOT/orchestrate.jl" evaluate \
+julia --project="$AI_ROOT" "$AI_ROOT/orchestrate.jl" evaluate --fast-forward \
   --launcher "$WAR1GUS_ROOT/build/war1gus" \
-  --data-dir "$WAR1GUS_DATA_DIR" \
+  --data-dir "$EVALUATION_RUN_DIR/data" \
   --rollout-config "$AI_ROOT/rollout.lua" \
-  --held-out-map 'maps/GoldRushAI-Max-Observer(5).smp' \
-  --matches 20 --workers 4 --timeout-cycles 18000 \
+  --held-out-map 'maps/4-middle-ground-AI-Observer(5).smp' \
+  --schedule "$EVALUATION_RUN_DIR/schedule.tsv" \
+  --matches 8 --workers 4 --timeout-cycles 180000 \
   --wall-timeout-seconds 7200 --seed 2 \
   --state-root "$EVALUATION_RUN_DIR" \
-  --checkpoint "$AI_ROOT/ai-training/checkpoint.jls" \
+  --checkpoint "$EVAL_CHECKPOINT" \
+  --league-snapshot "$EVAL_OPPONENT" \
   --output "$EVALUATION_RUN_DIR/evaluate.jsonl"
 ```
+The command above measures the default **greedy** deployment policy. For a
+separate exploratory diagnostic on a fresh private data copy and run root,
+repeat it with `--training-mixture` after `evaluate` and a distinct JSONL
+output; never combine its outcomes with greedy evaluation.
 
-Both examples use normal rendering. To opt in, add `--fast-forward` immediately
-after `train` or `evaluate` in the respective command (for example,
-`orchestrate.jl train --fast-forward` with the remaining arguments unchanged).
-This choice is independent of checkpoint state: an existing training run does
-not need `--reset` to change rendering behavior.
+For phase/seat comparisons, add rows covering each selected map and each
+eligible seat at each phase, keeping the opponent snapshot and seed for a
+given row fixed across checkpoints. Run each checkpoint with its own cloned
+data and fresh state/output root, passing the **same TSV file**. Training
+ablations can likewise use explicit schedules with the same child seeds and
+seats, changing only the intended map treatment; start each isolated run
+from its own copy of the same checkpoint and pinned opponent snapshot.
 
-Pass `--league-snapshot PATH` to pin every frozen opponent to one compatible
-snapshot instead of sampling the checkpoint's sibling `league/` directory.
+Both training and evaluation use normal rendering by default. Add
+`--fast-forward` to opt into display/event throttling. This choice is
+independent of checkpoint state; no `--reset` is needed to change it.
+
+`rollout_terminal` reports `produced_units` (successful training completions),
+`completed_buildings` (finished construction), `lost_units`, and
+`lost_buildings` (actual deaths/destructions). These per-game cumulative counts
+exclude map-start assets, ownership transfers, and walls. The aggregate
+`total_production` sums the first two and `own_losses` sums the latter two;
+`asset_efficiency` divides kills plus razings by `own_losses`, and
+`combat_efficiency` divides kills by `own_losses` (zero if no own losses).
+The older `total_units`/`total_buildings` fields are ownership totals, not
+production counts; surviving `units`/`buildings` cannot reconstruct true losses.
 
 ## Rewards and logs
 
