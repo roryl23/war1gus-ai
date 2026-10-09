@@ -466,8 +466,11 @@ checkpoint or league-snapshot file I/O run in that worker rather than on the
 request-response path; gameplay continues with the most recently published
 policy during an update. `WAR1GUS_AI_VERBOSE_LOG=1` also emits high-frequency
 diagnostics: Julia `network_request`, `network_response`,
-`reward_decomposition`, and complete `training_sample` events, plus Lua reward
-and action records.
+`decision_scores` (candidate scores, kinds, preferences, bootstrap scores, and
+selected index), `reward_decomposition`, and complete `training_sample`
+events, plus Lua reward, action, and `war1gus-ai.publish` command-verb records.
+A Lua `wait` marked `accepted` ends the selection stage without publishing an
+order; `published=true` reports order submission, not its later execution.
 
 The JSONL writer swaps two reusable queue buffers under the queue lock, then
 writes and flushes each batch off-lock before recycling its buffer. Event

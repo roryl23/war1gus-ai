@@ -3,7 +3,7 @@
 using KernelAbstractions: @kernel, @index, get_backend, synchronize
 
 struct PpoBatch{M<:AbstractMatrix{Float32},I<:AbstractVector{Int},
-                B<:AbstractVector{Bool},F<:AbstractVector{Float32}}
+ B<:AbstractVector{Bool},F<:AbstractVector{Float32}}
  headers::M
  entities::M
  candidates::M
@@ -678,6 +678,7 @@ function _ppo_loss(
                   clamp.(values .- batch.old_values, -clip_epsilon, clip_epsilon)
  clipped_value_loss = (clipped_values .- batch.targets) .^ 2
  critic_loss = 0.5f0 .* max.(unclipped_value_loss, clipped_value_loss)
- return sum(actor_loss .+ value_coefficient .* critic_loss .-
-            entropy_coefficient .* entropy) / Float32(count)
+ loss = sum(actor_loss .+ value_coefficient .* critic_loss .-
+            entropy_coefficient .* entropy)
+ return loss / Float32(count)
 end

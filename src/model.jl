@@ -1433,6 +1433,16 @@ function process_step!(
    action = argmax(scores) - 1
    log_probability = 0.0f0
   end
+  if verbose_logging_enabled()
+   log_event(
+    "decision_scores";
+    player=session.player, sequence, trainable=session.trainable,
+    selected=action, scores,
+    kinds=[candidate_kind(candidate) for candidate in observation.candidates],
+    preferred=[candidate.words[7] for candidate in observation.candidates],
+    bootstrap=[candidate_bootstrap_score(candidate) for candidate in observation.candidates],
+   )
+  end
   collectable = training && !_worker_busy_locked(trainer)
   session.previous = Decision(
    state, observation, action, Float32(log_probability), Float32(value),
