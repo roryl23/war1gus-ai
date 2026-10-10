@@ -35,10 +35,14 @@ reuse the 14-word entity record without changing protocol width.
 
 The engine derives build, train, upgrade, research, and spell choices from its
 registered producer and caster definitions. Lua offers movement, combat,
-transport, stop, hold, and cancellation orders to selectable owned actors.
-Buildings under construction or training remain observations but are not
-selectable actors: stop/cancel orders would discard the first hall or interrupt
-troop production. Harvesting choices are restricted to peasants and peons:
+transport, stop, and cancellation orders to selectable owned actors. Stop is
+offered only for non-idle actors: stopping an idle unit is an accepted no-op.
+Stand-ground is not an exploratory candidate because repeated hold orders
+suppress ordinary autonomous attacks; the engine command itself remains
+available outside this candidate catalog. Buildings under construction or
+training remain observations but are not selectable actors: stop/cancel orders
+would discard the first hall or interrupt troop production.
+Harvesting choices are restricted to peasants and peons:
 `resource-location` targets forest tiles containing trees, while `resource`
 targets live gold mine entities. Return-goods targets are filtered by the
 worker's carried resource: a depot must store that resource, rather than merely
@@ -50,6 +54,7 @@ depot is complete. Additional empty-handed harvesters can still build; idle
 workers and resource orders receive a soft exploration preference when fewer
 than two workers are harvesting. Other position actions retain normal map
 coordinates.
+
 Build-site coordinates for every building, including the first town hall, are
 limited to sites `AiCanBuildAt` reports legal during staged target selection.
 With no hall, an accepted locally preferred first-hall order reserves only
@@ -57,12 +62,37 @@ that builder until the hall finishes, the order aborts, or a bounded timeout
 expires. Other selectable actors remain available. Busy actors are not offered
 build/train catalog choices except that a worker harvesting resources may
 build. Build/train choices require current dependencies, affordability, supply,
-and unit limits; the same engine eligibility checks run again before publication.
-Available combat training and its idle producer receive an exploration preference,
-not a forced order. Other catalog actions remain available without these checks.
-Stratagus revalidates orders at publication; a formerly legal site or affordable
-order can become stale. A rejected publication incurs a bounded training penalty.
+and unit limits. Lua previews no-target orders directly and offers entity
+orders only when an actual target slot passes `AiCanPublishCommandBatch`.
+Resource-location checks a real forest tile; movement, patrol, explore,
+attack-ground, and unload use an on-map representative tile for their
+action-stage capability check. Build and position-spell actions rely on the
+engine catalog at the action stage rather than scanning the entire map for
+each entry. Their X choices require an actual legal Y, and all final Y and
+entity choices preview the complete command with its actual target.
+Candidate identities and `wait` stay unchanged; available combat training and
+its idle producer still receive an exploration preference rather than a forced
+order.
+Stratagus independently revalidates the command at publication and execution;
+a formerly legal target or affordable order can become stale. A rejected
+publication still incurs the bounded −5 training penalty, not a reward.
 Intermediate selections receive zero immediate reward and later PPO credit.
+
+Production reward reads the player's cumulative `TrainedUnits` and
+`CompletedBuildings` counters; Stratagus excludes walls from the completed
+building counter. At the first observation, or when loading an older reward
+book without these fields, both counters start at their current totals:
+existing units and buildings do not create retroactive credit. Each later
+positive delta earns +8 per trained unit and +20 per completed non-wall building;
+counter decreases rebase at the new value without subtracting reward or
+double-counting previous completions. These bonuses join existing resource,
+kill, razing, and damage progress in the same four-word reward header's
+`enemy_progress` field; protocol width and other reward weights remain intact.
+Only completed production earns the bonus, never an accepted/published order.
+Completion can arrive several staged decisions after the order and the reward
+is deferred to the next actor observation, so PPO credit remains delayed and
+is not a per-order attribution signal.
+
 Native strategic AI managers remain suppressed for `war1gus-ai`, but ordinary
 unit-level combat remains active: idle aggressive mobile units acquire visible
 enemies within reaction range, stand-ground units attack within weapon range,
@@ -466,11 +496,29 @@ checkpoint or league-snapshot file I/O run in that worker rather than on the
 request-response path; gameplay continues with the most recently published
 policy during an update. `WAR1GUS_AI_VERBOSE_LOG=1` also emits high-frequency
 diagnostics: Julia `network_request`, `network_response`,
-`decision_scores` (candidate scores, kinds, preferences, bootstrap scores, and
-selected index), `reward_decomposition`, and complete `training_sample`
-events, plus Lua reward, action, and `war1gus-ai.publish` command-verb records.
-A Lua `wait` marked `accepted` ends the selection stage without publishing an
-order; `published=true` reports order submission, not its later execution.
+`decision_scores` (candidate scores, kinds, preferences, bootstrap scores,
+selected index, policy generation, and whether the decision is collectable),
+`reward_decomposition`, complete `training_sample` events, and per-collected-step
+`credit_assignment` records (selected candidate kind/action, reward, old value,
+raw and normalized GAE advantage, terminal flag, fragment step/length and
+bootstrap value), plus Lua reward, action, `war1gus-ai.publish` command-verb, and
+`war1gus-ai.outcomes` records. At each actor-stage observation, `war1gus-ai.outcomes`
+reports `player`, `observation_cycle` (`GameCycle`), cumulative
+`total_resources_gold`/`total_resources_wood` (`TotalResources` deposited gold
+and wood), `trained_units` (`TrainedUnits`), `completed_buildings`
+(`CompletedBuildings`), `total_kills`, `total_razings`, and
+`total_enemy_asset_damage`. Training and construction counts reflect completed
+production, not merely requested commands. A Lua `wait` marked `accepted` ends
+the selection stage without publishing an order; `published=true` reports order
+submission, not its later execution or a completed resource deposit, unit, or
+building.
+
+`credit_assignment` records the PPO advantage assigned to each collected
+decision, including its player, `game_cycle`, and the trajectory-fragment
+boundary and bootstrap value used for that advantage. Compare its cycle to the
+`observation_cycle` in `war1gus-ai.outcomes` for the same player, then follow
+later outcomes to observe deposits, production, and combat; neither an accepted
+selection nor a published order alone establishes that these outcomes occurred.
 
 The JSONL writer swaps two reusable queue buffers under the queue lock, then
 writes and flushes each batch off-lock before recycling its buffer. Event

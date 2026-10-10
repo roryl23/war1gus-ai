@@ -757,6 +757,7 @@ struct TrajectoryStep
  old_log_probability::Float32
  old_value::Float32
  terminal::Bool
+ sequence::UInt32
 end
 
 struct TrajectoryFragment
@@ -1148,7 +1149,35 @@ function trajectory_targets_and_advantages(trainer::OnlineTrainer, fragments::Ve
  isempty(steps) && return steps, targets, advantages
  scale = std(advantages; corrected=false)
  normalized = scale > eps(Float32) ? (advantages .- mean(advantages)) ./ scale : advantages .- mean(advantages)
- return steps, targets, Float32.(normalized)
+ normalized_advantages = Float32.(normalized)
+ if verbose_logging_enabled()
+  flat_index = 0
+  for (fragment_index, fragment) in enumerate(fragments)
+   for (step_index, step) in enumerate(fragment.steps)
+    flat_index += 1
+    log_event(
+     "credit_assignment";
+     player=Int(step.observation.header[2]),
+     game_cycle=Int(step.observation.header[4]),
+     sequence=step.sequence,
+     decision_sequence=step.sequence - one(UInt32),
+     policy_generation=trainer.policy_generation,
+     candidate_kind=candidate_name(candidate_kind(step.observation.candidates[step.action+1])),
+     action=step.action,
+     reward=step.reward,
+     old_value=step.old_value,
+     raw_gae=advantages[flat_index],
+     normalized_gae=normalized_advantages[flat_index],
+     terminal=step.terminal,
+     fragment_index,
+     step_index,
+     fragment_length=length(fragment.steps),
+     bootstrap_value=fragment.bootstrap_value,
+    )
+   end
+  end
+ end
+ return steps, targets, normalized_advantages
 end
 
 include("training.jl")
@@ -1340,9 +1369,12 @@ function _log_training_step(
   "training_sample";
   session_id=Int(player_of(decision.state)),
   sequence,
+  decision_sequence=sequence - one(UInt32),
   state=decision.state,
   action=decision.action,
   candidate_kind=candidate_name(candidate_kind(decision.observation.candidates[decision.action+1])),
+  old_value=decision.value,
+  policy_generation=decision.policy_generation,
   reward,
   next_state,
   terminal,
@@ -1411,7 +1443,7 @@ function process_step!(
      session.fragment,
      TrajectoryStep(
       previous.observation, previous.action, Float32(reward),
-      previous.log_probability, previous.value, false,
+      previous.log_probability, previous.value, false, sequence,
      ),
     )
     session.fragment_generation = trainer.policy_generation
@@ -1433,17 +1465,18 @@ function process_step!(
    action = argmax(scores) - 1
    log_probability = 0.0f0
   end
+  collectable = training && !_worker_busy_locked(trainer)
   if verbose_logging_enabled()
    log_event(
     "decision_scores";
     player=session.player, sequence, trainable=session.trainable,
+    policy_generation=trainer.policy_generation, collectable,
     selected=action, scores,
     kinds=[candidate_kind(candidate) for candidate in observation.candidates],
     preferred=[candidate.words[7] for candidate in observation.candidates],
     bootstrap=[candidate_bootstrap_score(candidate) for candidate in observation.candidates],
    )
   end
-  collectable = training && !_worker_busy_locked(trainer)
   session.previous = Decision(
    state, observation, action, Float32(log_probability), Float32(value),
    trainer.policy_generation, collectable,
@@ -1481,7 +1514,7 @@ function process_terminal!(
     session.fragment,
     TrajectoryStep(
      previous.observation, previous.action, Float32(reward),
-     previous.log_probability, previous.value, true,
+     previous.log_probability, previous.value, true, sequence,
     ),
    )
    session.fragment_generation = trainer.policy_generation

@@ -99,7 +99,7 @@ end
   push!(targets, index in (1, 3) ? value + 1.0f0 : old_value)
   push!(steps, War1gusAI.TrajectoryStep(
    observations[index], actions[index], 0.0f0,
-   log_probability - log(ratios[index]), old_value, false,
+   log_probability - log(ratios[index]), old_value, false, UInt32(index),
   ))
  end
  clip_epsilon, value_coefficient, entropy_coefficient = 0.2f0, 0.5f0, 0.01f0
@@ -132,7 +132,7 @@ function representative_ppo_fragments(policy)
   scores, value = War1gusAI._policy_forward(policy, observation)
   log_probability = War1gusAI.training_action_log_probabilities(scores, observation.candidates)[actions[index]+1]
   push!(steps, War1gusAI.TrajectoryStep(
-   observation, actions[index], rewards[index], log_probability, value, index == length(observations),
+   observation, actions[index], rewards[index], log_probability, value, index == length(observations), UInt32(index),
   ))
  end
  return [War1gusAI.TrajectoryFragment(steps, 0.0f0, true)]
@@ -218,7 +218,7 @@ end
      War1gusAI.training_action_log_probabilities(
       empty_scores, empty_observation.candidates,
      )[3],
-     empty_value, true,
+     empty_value, true, UInt32(0),
     )
     empty_batch = War1gusAI._pack_ppo_batch(
      [empty_step], Float32[empty_value+1.0f0], Float32[1.0f0],
@@ -323,7 +323,7 @@ end
  @test plain_probabilities ≈ Float32[0.05, 0.05+0.8/3, 0.05+0.8/3, 0.05+0.8/3] atol = 1f-6
  @test probabilities[3] > plain_probabilities[3]
 
- step = War1gusAI.TrajectoryStep(observation, 2, 0.0f0, log_probabilities[3], 0.0f0, false)
+ step = War1gusAI.TrajectoryStep(observation, 2, 0.0f0, log_probabilities[3], 0.0f0, false, UInt32(0))
  batch = War1gusAI._pack_ppo_batch([step], Float32[0], Float32[1])
  packed_statistics = War1gusAI._segmented_policy_statistics(
   scores, batch.candidate_offsets, batch.actions, batch.first_waits,
@@ -347,7 +347,7 @@ end
  for observation in (with_entity, without_entity)
   scores, value = War1gusAI._policy_forward(policy, observation)
   step = War1gusAI.TrajectoryStep(
-   observation, 1, 0.0f0, War1gusAI.training_action_log_probabilities(scores, observation.candidates)[2], value, false,
+   observation, 1, 0.0f0, War1gusAI.training_action_log_probabilities(scores, observation.candidates)[2], value, false, UInt32(0),
   )
   batch = War1gusAI._pack_ppo_batch([step], Float32[value+1], Float32[0.7])
   result = Flux.withgradient(policy) do trained_policy
@@ -544,8 +544,8 @@ end
  )
  fragment = War1gusAI.TrajectoryFragment(
   War1gusAI.TrajectoryStep[
-   War1gusAI.TrajectoryStep(observation, 0, 1.0f0, 0.0f0, 0.1f0, false),
-   War1gusAI.TrajectoryStep(observation, 1, 2.0f0, 0.0f0, 0.2f0, true),
+   War1gusAI.TrajectoryStep(observation, 0, 1.0f0, 0.0f0, 0.1f0, false, UInt32(1)),
+   War1gusAI.TrajectoryStep(observation, 1, 2.0f0, 0.0f0, 0.2f0, true, UInt32(2)),
   ],
   0.0f0,
   true,
@@ -559,6 +559,48 @@ end
  @test normalized_targets == targets
  @test isapprox(mean(normalized_advantages), 0.0f0; atol=1f-6)
  @test all(isfinite, normalized_advantages)
+
+ # Logging follows the flattened PPO batch, including a bootstrapped fragment.
+ bootstrapped = War1gusAI.TrajectoryFragment(
+  [War1gusAI.TrajectoryStep(observation, 1, -1.0f0, 0.0f0, 0.3f0, false, UInt32(3))],
+  0.7f0, false,
+ )
+ fragments = [fragment, bootstrapped]
+ raw_advantages = vcat(advantages, War1gusAI._fragment_gae(trainer, bootstrapped)[2])
+ mktempdir() do directory
+  log_path = joinpath(directory, "credits.jsonl")
+  withenv("WAR1GUS_AI_VERBOSE_LOG" => "1") do
+   War1gusAI.start_event_logger!(path=log_path, stdout_io=devnull, mirror_to_stdout=false)
+   try
+    logged_steps, logged_targets, logged_advantages =
+     War1gusAI.trajectory_targets_and_advantages(trainer, fragments)
+    @test logged_steps == vcat(fragment.steps, bootstrapped.steps)
+    @test logged_targets == vcat(targets, War1gusAI._fragment_gae(trainer, bootstrapped)[1])
+    @test length(logged_advantages) == 3
+    @test isapprox(mean(logged_advantages), 0.0f0; atol=1f-6)
+   finally
+    War1gusAI.stop_event_logger!()
+   end
+  end
+  credits = filter(record -> occursin("\"type\":\"credit_assignment\"", record), readlines(log_path))
+  @test length(credits) == 3
+  _, _, expected_normalized = War1gusAI.trajectory_targets_and_advantages(trainer, fragments)
+  for (index, record) in enumerate(credits)
+   step = index <= 2 ? fragment.steps[index] : only(bootstrapped.steps)
+   @test occursin("\"game_cycle\":100", record)
+   @test occursin("\"player\":0", record)
+   @test occursin("\"sequence\":$(step.sequence)", record)
+   @test occursin("\"action\":$(step.action)", record)
+   @test occursin("\"raw_gae\":$(raw_advantages[index])", record)
+   @test occursin("\"normalized_gae\":$(expected_normalized[index])", record)
+   @test occursin("\"old_value\":$(step.old_value)", record)
+   @test occursin("\"terminal\":$(step.terminal)", record)
+   @test occursin("\"fragment_index\":$(index <= 2 ? 1 : 2)", record)
+   @test occursin("\"step_index\":$(index <= 2 ? index : 1)", record)
+   @test occursin("\"fragment_length\":$(index <= 2 ? 2 : 1)", record)
+   @test occursin("\"bootstrap_value\":$(index <= 2 ? 0.0f0 : 0.7f0)", record)
+  end
+ end
 
  mktempdir() do directory
   checkpoint = joinpath(directory, "ppo.jls")
@@ -800,6 +842,14 @@ end
    @test count(record -> occursin("\"session_id\":11", record), samples) == 2
    @test all(record -> occursin("\"state\":[", record), samples)
    @test any(record -> occursin("\"next_state\":[", record), samples)
+   @test all(record -> occursin("\"old_value\":", record) &&
+     occursin("\"policy_generation\":0", record), samples)
+   decisions = filter(record -> occursin("\"type\":\"decision_scores\"", record), readlines(log_path))
+   @test length(decisions) == 3
+   @test all(record -> occursin("\"policy_generation\":0", record) &&
+     occursin("\"collectable\":true", record), decisions)
+   credits = filter(record -> occursin("\"type\":\"credit_assignment\"", record), readlines(log_path))
+   @test length(credits) == length(samples)
   end
  end
 end
@@ -835,6 +885,8 @@ end
   records = readlines(log_path)
   @test !any(record -> occursin("\"type\":\"training_sample\"", record), records)
   @test !any(record -> occursin("\"type\":\"reward_decomposition\"", record), records)
+  @test !any(record -> occursin("\"type\":\"credit_assignment\"", record), records)
+  @test !any(record -> occursin("\"type\":\"decision_scores\"", record), records)
   @test !any(record -> occursin("\"state\":[", record), records)
   @test any(record -> occursin("\"type\":\"episode_finalized\"", record), records)
  end
