@@ -2,16 +2,22 @@ using Flux
 using Random
 using Serialization
 using Statistics
+using ChainRulesCore
 
 model_state_snapshot(policy) = deepcopy(Flux.state(policy))
 
 # The pre-packing PPO objective, kept here as an independent scalar oracle.
-function scalar_ppo_reference(policy, steps, targets, advantages, clip_epsilon, value_coefficient, entropy_coefficient)
+function scalar_ppo_reference(
+ policy, steps, targets, advantages, clip_epsilon, value_coefficient, entropy_coefficient;
+ temperature=nothing,
+)
  total_loss = 0.0f0
  for index in eachindex(steps)
   step = steps[index]
   scores, value = War1gusAI._policy_forward(policy, step.observation)
-  log_probabilities = War1gusAI.training_action_log_probabilities(scores, step.observation.candidates)
+  log_probabilities = War1gusAI.training_action_log_probabilities(
+   scores, step.observation.candidates; temperature,
+  )
   log_probability = log_probabilities[step.action+1]
   entropy = -sum(exp.(log_probabilities) .* log_probabilities)
   ratio = exp(log_probability - step.old_log_probability)
@@ -83,43 +89,47 @@ function representative_ppo_observations()
 end
 
 @testset "packed PPO matches scalar objective and every trainable gradient" begin
- policy = War1gusAI.create_policy(seed=43)
- observations = representative_ppo_observations()
- actions = [3, 2, 2, 1] # Zero-based catalog indices, including the concentrated logit.
- ratios = Float32[1.6, 0.5, 1.05, 0.95]
- advantages = Float32[1.0, -0.8, 0.6, -0.7]
- targets = Float32[]
- steps = War1gusAI.TrajectoryStep[]
- for index in eachindex(observations)
-  scores, value = War1gusAI._policy_forward(policy, observations[index])
-  log_probability = War1gusAI.training_action_log_probabilities(scores, observations[index].candidates)[actions[index]+1]
-  old_value = value - 1.0f0
-  # Both max branches: target above the current value selects the clipped
-  # critic; target at the old value selects the unclipped critic.
-  push!(targets, index in (1, 3) ? value + 1.0f0 : old_value)
-  push!(steps, War1gusAI.TrajectoryStep(
-   observations[index], actions[index], 0.0f0,
-   log_probability - log(ratios[index]), old_value, false, UInt32(index),
-  ))
- end
- clip_epsilon, value_coefficient, entropy_coefficient = 0.2f0, 0.5f0, 0.01f0
- batch = War1gusAI._pack_ppo_batch(steps, targets, advantages)
- scalar = Flux.withgradient(policy) do trained_policy
-  scalar_ppo_reference(
-   trained_policy, steps, targets, advantages, clip_epsilon,
-   value_coefficient, entropy_coefficient,
-  )
- end
- packed = Flux.withgradient(policy) do trained_policy
-  War1gusAI._ppo_loss(
-   trained_policy, batch, clip_epsilon, value_coefficient, entropy_coefficient,
-  )
- end
- @test packed.val ≈ scalar.val atol = 2f-5 rtol = 2f-5
- for (actual, expected) in zip(policy_gradient_arrays(packed.grad[1]), policy_gradient_arrays(scalar.grad[1]))
-  # Matmul over packed columns changes Float32 reduction order from the
-  # scalar path, particularly through the segmented entity mean.
-  @test actual ≈ expected atol = 3f-5 rtol = 3f-4
+ for temperature in (nothing, 20.0f0)
+  policy = War1gusAI.create_policy(seed=43)
+  observations = representative_ppo_observations()
+  actions = [3, 2, 2, 1] # Zero-based catalog indices, including the concentrated logit.
+  ratios = Float32[1.6, 0.5, 1.05, 0.95]
+  advantages = Float32[1.0, -0.8, 0.6, -0.7]
+  targets = Float32[]
+  steps = War1gusAI.TrajectoryStep[]
+  for index in eachindex(observations)
+   scores, value = War1gusAI._policy_forward(policy, observations[index])
+   log_probability = War1gusAI.training_action_log_probabilities(
+    scores, observations[index].candidates; temperature,
+   )[actions[index]+1]
+   old_value = value - 1.0f0
+   # Both max branches: target above the current value selects the clipped
+   # critic; target at the old value selects the unclipped critic.
+   push!(targets, index in (1, 3) ? value + 1.0f0 : old_value)
+   push!(steps, War1gusAI.TrajectoryStep(
+    observations[index], actions[index], 0.0f0,
+    log_probability - log(ratios[index]), old_value, false, UInt32(index),
+   ))
+  end
+  clip_epsilon, value_coefficient, entropy_coefficient = 0.2f0, 0.5f0, 0.01f0
+  batch = War1gusAI._pack_ppo_batch(steps, targets, advantages)
+  scalar = Flux.withgradient(policy) do trained_policy
+   scalar_ppo_reference(
+    trained_policy, steps, targets, advantages, clip_epsilon,
+    value_coefficient, entropy_coefficient; temperature,
+   )
+  end
+  packed = Flux.withgradient(policy) do trained_policy
+   War1gusAI._ppo_loss(
+    trained_policy, batch, clip_epsilon, value_coefficient, entropy_coefficient, temperature,
+   )
+  end
+  @test packed.val ≈ scalar.val atol = 2f-5 rtol = 2f-5
+  for (actual, expected) in zip(policy_gradient_arrays(packed.grad[1]), policy_gradient_arrays(scalar.grad[1]))
+   # Matmul over packed columns changes Float32 reduction order from the
+   # scalar path, particularly through the segmented entity mean.
+   @test actual ≈ expected atol = 3f-5 rtol = 3f-4
+  end
  end
 end
 
@@ -208,6 +218,34 @@ end
     @test Float32(gpu_result.val) ≈ cpu_result.val atol = 2f-4 rtol = 2f-4
     for (actual, expected) in zip(
      policy_gradient_arrays(gpu_result.grad[1]), policy_gradient_arrays(cpu_result.grad[1]),
+    )
+     @test Array(actual) ≈ expected atol = 4f-4 rtol = 3f-3
+    end
+    temperature_steps = [War1gusAI.TrajectoryStep(
+     step.observation, step.action, step.reward,
+     War1gusAI.training_action_log_probabilities(
+      War1gusAI.candidate_scores(trainer.policy, step.observation),
+      step.observation.candidates; temperature=20.0f0,
+     )[step.action+1],
+     step.old_value, step.terminal, step.sequence,
+    ) for step in steps]
+    tempered_batch = War1gusAI._pack_ppo_batch(temperature_steps, targets, advantages)
+    tempered_gpu_batch = War1gusAI._ppo_batch_on_device(tempered_batch, trainer.training_device)
+    tempered_gpu = Flux.withgradient(gpu_policy) do policy
+     War1gusAI._ppo_loss(
+      policy, tempered_gpu_batch, trainer.clip_epsilon, trainer.value_coefficient,
+      trainer.entropy_coefficient, 20.0f0,
+     )
+    end
+    tempered_cpu = Flux.withgradient(trainer.policy) do policy
+     War1gusAI._ppo_loss(
+      policy, tempered_batch, trainer.clip_epsilon, trainer.value_coefficient,
+      trainer.entropy_coefficient, 20.0f0,
+     )
+    end
+    @test Float32(tempered_gpu.val) ≈ tempered_cpu.val atol = 2f-4 rtol = 2f-4
+    for (actual, expected) in zip(
+     policy_gradient_arrays(tempered_gpu.grad[1]), policy_gradient_arrays(tempered_cpu.grad[1]),
     )
      @test Array(actual) ≈ expected atol = 4f-4 rtol = 3f-3
     end
@@ -331,6 +369,127 @@ end
  )
  @test packed_statistics[1, 1] ≈ log_probabilities[3] atol = 1f-6
  @test packed_statistics[2, 1] ≈ -sum(probabilities .* log_probabilities) atol = 1f-6
+end
+
+@testset "temperature sampler and saturated PPO actor derivatives" begin
+ observation = War1gusAI.parse_state(v3_state(candidates=[
+  v3_candidate(bootstrap=38_000), v3_candidate(kind=7, bootstrap=0),
+ ]))
+ scores = Float32[38, 0]
+ temperature = 20.0f0
+ log_probabilities = War1gusAI.training_action_log_probabilities(
+  scores, observation.candidates; temperature,
+ )
+ probabilities = exp.(log_probabilities)
+ @test probabilities ≈ exp.(Flux.logsoftmax(scores ./ temperature)) atol = 1f-6
+ @test sum(probabilities) ≈ 1.0f0 atol = 1f-6
+ @test probabilities[2] ≈ 0.130108f0 atol = 1f-5
+ rng = MersenneTwister(730)
+ choices = [War1gusAI.sample_candidate(scores, observation.candidates, rng; temperature) for _ in 1:4000]
+ @test abs(count(==(1), choices) / length(choices) - probabilities[2]) < 0.025
+ mixture_log = War1gusAI.training_action_log_probabilities(scores, observation.candidates)
+ @test exp(mixture_log[2]) > 0.79f0
+
+ offsets, actions = [1, 3], [2]
+ statistics, pullback = ChainRulesCore.rrule(
+  War1gusAI._segmented_temperature_statistics, scores, offsets, actions, temperature,
+ )
+ @test statistics[1, 1] ≈ log_probabilities[2] atol = 1f-6
+ @test statistics[2, 1] ≈ -sum(probabilities .* log_probabilities) atol = 1f-6
+ for output in 1:2
+  cotangent = zeros(Float32, 2, 1)
+  cotangent[output, 1] = 1.0f0
+  analytical = pullback(cotangent)[2]
+  numerical = [
+   begin
+    plus, minus = copy(scores), copy(scores)
+    plus[index] += 0.01f0
+    minus[index] -= 0.01f0
+    (War1gusAI._segmented_temperature_statistics(plus, offsets, actions, temperature)[output, 1] -
+     War1gusAI._segmented_temperature_statistics(minus, offsets, actions, temperature)[output, 1]) / 0.02f0
+   end for index in eachindex(scores)
+  ]
+  @test analytical ≈ numerical atol = 3f-4 rtol = 0.02
+ end
+ # On-policy positive advantage: a PPO score-gradient step raises the non-wait gap.
+ objective = score -> begin
+  stats = War1gusAI._segmented_temperature_statistics(score, offsets, actions, temperature)
+  ratio = exp(stats[1, 1] - log_probabilities[2])
+  -min(ratio, clamp(ratio, 0.8f0, 1.2f0))
+ end
+ gradient = Flux.gradient(objective, scores)[1]
+ @test gradient[2] < -0.01f0
+ @test gradient[1] > 0.01f0
+ updated = scores .- gradient
+ @test updated[2] - updated[1] > scores[2] - scores[1]
+ policy = War1gusAI.create_policy(seed=730)
+ fill!(policy.score_head.layers[2].weight, 0.0f0)
+ fill!(policy.score_head.layers[2].bias, 0.0f0)
+ @test War1gusAI.candidate_scores(policy, observation) ≈ scores atol = 1f-6
+ value = War1gusAI.value_estimate(policy, observation)
+ step = War1gusAI.TrajectoryStep(
+  observation, 1, 0.0f0, log_probabilities[2], value, true, UInt32(0),
+ )
+ batch = War1gusAI._pack_ppo_batch([step], Float32[value], Float32[1])
+ result = Flux.withgradient(policy) do trained_policy
+  War1gusAI._ppo_loss(trained_policy, batch, 0.2f0, 0.0f0, 0.0f0, temperature)
+ end
+ @test isfinite(result.val)
+ @test maximum(abs, result.grad[1].score_head.layers[2].weight) > 1f-5
+ before_gap = scores[2] - scores[1]
+ Flux.update!(Flux.setup(Flux.Adam(0.01f0), policy), policy, result.grad[1])
+ after_scores = War1gusAI.candidate_scores(policy, observation)
+ @test after_scores[2] - after_scores[1] > before_gap + 1f-5
+ # Entropy rewards flattening a wait-biased tempered policy.
+ entropy_gradient = pullback(reshape(Float32[0, -1], 2, 1))[2]
+ @test entropy_gradient[2] < 0.0f0
+ @test entropy_gradient[1] > 0.0f0
+end
+
+@testset "training temperature option is validated and frozen" begin
+ withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => nothing) do
+  @test isnothing(War1gusAI.training_temperature_from_environment())
+  trainer = War1gusAI.create_trainer(
+   mode=War1gusAI.MODE_TRAIN, checkpoint_path=tempname(), training_device=:cpu,
+  )
+  @test isnothing(trainer.training_temperature)
+ end
+ for invalid in ("", "0", "-20", "NaN", "Inf", "1e300", "not-a-number")
+  withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => invalid) do
+   @test_throws ArgumentError War1gusAI.training_temperature_from_environment()
+   @test_throws ArgumentError War1gusAI.create_trainer(
+    mode=War1gusAI.MODE_TRAIN, checkpoint_path=tempname(), training_device=:cpu,
+   )
+   inference = War1gusAI.create_trainer(
+    mode=War1gusAI.MODE_INFERENCE, checkpoint_path=tempname(), training_device=:cpu,
+   )
+   readonly = War1gusAI.create_trainer(
+    mode=War1gusAI.MODE_TRAIN, read_only=true, checkpoint_path=tempname(), training_device=:cpu,
+   )
+   @test isnothing(inference.training_temperature)
+   @test isnothing(readonly.training_temperature)
+  end
+ end
+ withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => "20") do
+  training = War1gusAI.create_trainer(
+   mode=War1gusAI.MODE_TRAIN, checkpoint_path=tempname(), training_device=:cpu,
+  )
+  inference = War1gusAI.create_trainer(
+   mode=War1gusAI.MODE_INFERENCE, checkpoint_path=tempname(), training_device=:cpu,
+  )
+  readonly = War1gusAI.create_trainer(
+   mode=War1gusAI.MODE_TRAIN, checkpoint_path=tempname(), training_device=:cpu, read_only=true,
+  )
+  @test training.training_temperature == 20.0f0
+  @test isnothing(inference.training_temperature)
+  @test isnothing(readonly.training_temperature)
+  withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => "5") do
+   @test training.training_temperature == 20.0f0
+  end
+  observation = first(representative_ppo_observations())
+  @test War1gusAI.select_action(inference.policy, observation; temperature=20.0f0) ==
+        War1gusAI.select_action(inference.policy, observation)
+ end
 end
 
 @testset "entity-free PPO does not advance Adam's entity momentum" begin
@@ -981,6 +1140,41 @@ end
   @test !isempty(train_session.fragment)
   @test isempty(opponent_session.fragment)
 
+  # The opt-in applies only to the mutable training seat. Frozen opponents
+  # retain the original behavior distribution, even in the same league game.
+  tempered = withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => "20") do
+   War1gusAI.create_trainer(
+    mode=War1gusAI.MODE_LEAGUE, checkpoint_path=checkpoint,
+    league_snapshot_override=snapshot, seed=61, train_player=UInt32(0),
+    batch_size=128, rollout_fragment=128, training_device=:cpu,
+   )
+  end
+  @test tempered.training_temperature == 20.0f0
+  frozen = War1gusAI._load_frozen_policy(tempered, snapshot)
+  expected_rng = MersenneTwister(61)
+  tempered_train = War1gusAI.ClientSession()
+  tempered_opponent = War1gusAI.ClientSession()
+  withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => "2") do
+   for sequence in 0:15
+    for (session, state, temperature) in (
+     (tempered_train, train_state, 20.0f0),
+     (tempered_opponent, opponent_state, nothing),
+    )
+     observation = War1gusAI.parse_state(state)
+     active_policy = session === tempered_train ? tempered.policy : frozen
+     log_probs = War1gusAI.training_action_log_probabilities(
+      War1gusAI.candidate_scores(active_policy, observation), observation.candidates; temperature,
+     )
+     expected = War1gusAI._sample_from_log_probabilities(log_probs, expected_rng)
+     actual = War1gusAI.process_step!(tempered, session, UInt32(sequence), Int32(0), state)
+     @test actual == expected
+     @test session.previous.log_probability ≈ log_probs[actual+1] atol = 1f-6
+    end
+   end
+  end
+  @test !isempty(tempered_train.fragment)
+  @test isempty(tempered_opponent.fragment)
+
   single_wait = player -> v3_state(player=player, candidates=[v3_candidate(bootstrap=12_000)])
   @test War1gusAI.process_step!(
    trainer, train_session, UInt32(32), Int32(0), single_wait(0),
@@ -990,7 +1184,10 @@ end
   ) == 0
   @test isempty(opponent_session.fragment)
 
-  evaluation = withenv("WAR1GUS_AI_EVAL_TRAINING_MIXTURE" => nothing) do
+  evaluation = withenv(
+   "WAR1GUS_AI_EVAL_TRAINING_MIXTURE" => nothing,
+   "WAR1GUS_AI_TRAIN_TEMPERATURE" => "20",
+  ) do
    War1gusAI.create_trainer(
     mode=War1gusAI.MODE_LEAGUE_EVALUATE,
     checkpoint_path=checkpoint,
@@ -1008,8 +1205,12 @@ end
    @test isempty(session.fragment)
   end
   @test !evaluation.eval_training_mixture
+  @test isnothing(evaluation.training_temperature)
   original_checkpoint, original_snapshot = read(checkpoint), read(snapshot)
-  exploratory = withenv("WAR1GUS_AI_EVAL_TRAINING_MIXTURE" => "1") do
+  exploratory = withenv(
+   "WAR1GUS_AI_EVAL_TRAINING_MIXTURE" => "1",
+   "WAR1GUS_AI_TRAIN_TEMPERATURE" => "20",
+  ) do
    War1gusAI.create_trainer(
     mode=War1gusAI.MODE_LEAGUE_EVALUATE,
     checkpoint_path=checkpoint,
@@ -1020,6 +1221,7 @@ end
   end
   @test exploratory.eval_training_mixture
   @test !War1gusAI.is_training(exploratory)
+  @test isnothing(exploratory.training_temperature)
   expected_rng = MersenneTwister(67)
   exploratory_sessions = (War1gusAI.ClientSession(), War1gusAI.ClientSession())
   exploratory_choices = (Int[], Int[])

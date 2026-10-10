@@ -34,6 +34,8 @@ const TRAIN_EXPLORATION_FRACTION = 0.8f0
 const TRAIN_POLICY_FRACTION = 1.0f0 - TRAIN_EXPLORATION_FRACTION
 const TRAIN_LOG_POLICY_FRACTION = log(TRAIN_POLICY_FRACTION)
 
+include("training_temperature.jl")
+
 
 function training_seed_from_environment()::Int
  raw = get(ENV, "WAR1GUS_AI_SEED", "")
@@ -575,13 +577,25 @@ function _training_exploration_weight_sum(candidates::AbstractVector{CandidateOb
  return total
 end
 
-"""Log probabilities of the training policy mixture in original catalog order."""
+"""Log probabilities of the selected training policy in original catalog order."""
 function training_action_log_probabilities(
- scores::AbstractVector{<:Real}, candidates::AbstractVector{CandidateObservation},
+ scores::AbstractVector{<:Real}, candidates::AbstractVector{CandidateObservation};
+ temperature::Union{Nothing,Float32}=nothing,
 )::Vector{Float32}
  count = length(candidates)
  count > 0 || throw(ArgumentError("cannot sample an empty candidate sequence"))
  length(scores) == count || throw(ArgumentError("scores and candidates must have equal lengths"))
+ if !isnothing(temperature)
+  isfinite(temperature) && temperature > 0.0f0 ||
+   throw(ArgumentError("training temperature must be finite and positive"))
+  maximum_score = maximum(scores) / temperature
+  normalization = 0.0f0
+  for score in scores
+   normalization += exp(Float32(score) / temperature - maximum_score)
+  end
+  log_normalization = log(normalization)
+  return [Float32(score) / temperature - maximum_score - log_normalization for score in scores]
+ end
  skip_wait = count > 1 && candidate_kind(first(candidates)) == 0
  weight_sum = _training_exploration_weight_sum(candidates, skip_wait)
  return map(
@@ -593,6 +607,7 @@ function training_action_log_probabilities(
   eachindex(candidates), Flux.logsoftmax(scores),
  )
 end
+
 
 function _sample_from_log_probabilities(log_probabilities::AbstractVector{<:Real}, rng::AbstractRNG)::Int
  isempty(log_probabilities) && throw(ArgumentError("cannot sample an empty candidate sequence"))
@@ -606,9 +621,12 @@ function _sample_from_log_probabilities(log_probabilities::AbstractVector{<:Real
 end
 
 function sample_candidate(
- scores::AbstractVector{<:Real}, candidates::AbstractVector{CandidateObservation}, rng::AbstractRNG,
+ scores::AbstractVector{<:Real}, candidates::AbstractVector{CandidateObservation}, rng::AbstractRNG;
+ temperature::Union{Nothing,Float32}=nothing,
 )::Int
- return _sample_from_log_probabilities(training_action_log_probabilities(scores, candidates), rng)
+ return _sample_from_log_probabilities(
+  training_action_log_probabilities(scores, candidates; temperature), rng,
+ )
 end
 
 """Choose greedily for inference and stochastically from supplied candidates during training."""
@@ -617,13 +635,16 @@ function select_action(
  observation::StateObservation;
  training::Bool=false,
  rng::AbstractRNG=Random.default_rng(),
+ temperature::Union{Nothing,Float32}=nothing,
 )::Int
  scores = if training
   candidate_scores(policy, observation)
  else
   first(_inference_forward!(InferenceWorkspace(), policy, observation))
  end
- return training ? sample_candidate(scores, observation.candidates, rng) : argmax(scores) - 1
+ return training ?
+        (isnothing(temperature) ? sample_candidate(scores, observation.candidates, rng) :
+         sample_candidate(scores, observation.candidates, rng; temperature)) : argmax(scores) - 1
 end
 
 function select_action(policy::AiPolicy, state::AbstractVector{<:Integer}; kwargs...)::Int
@@ -805,6 +826,7 @@ mutable struct OnlineTrainer{O,R<:AbstractRNG,D}
  mode::Symbol
  read_only::Bool
  eval_training_mixture::Bool
+ training_temperature::Union{Nothing,Float32}
  training_device::D
  training_backend::Symbol
  gamma::Float32
@@ -1022,6 +1044,9 @@ function create_trainer(
  league_snapshot_every::Integer=DEFAULT_LEAGUE_SNAPSHOT_EVERY,
  league_max_snapshots::Integer=DEFAULT_LEAGUE_MAX_SNAPSHOTS,
  read_only::Bool=read_only_from_environment(),
+ training_temperature::Union{Nothing,Float32}=
+ mode in (MODE_TRAIN, MODE_RESET_TRAIN, MODE_LEAGUE) && !read_only ?
+ training_temperature_from_environment() : nothing,
  league_path::AbstractString=league_directory_from_environment(checkpoint_path),
  league_snapshot_override::Union{Nothing,AbstractString}=league_snapshot_from_environment(),
  policy::Union{Nothing,AiPolicy}=nothing,
@@ -1041,6 +1066,12 @@ function create_trainer(
  entropy_coefficient >= 0 || throw(ArgumentError("entropy coefficient must not be negative"))
  eval_training_mixture = mode == MODE_LEAGUE_EVALUATE &&
                          strip(get(ENV, "WAR1GUS_AI_EVAL_TRAINING_MIXTURE", "")) == "1"
+ if !isnothing(training_temperature)
+  isfinite(training_temperature) && training_temperature > 0.0f0 ||
+   throw(ArgumentError("training temperature must be finite and positive"))
+ end
+ selected_temperature = mode in (MODE_TRAIN, MODE_RESET_TRAIN, MODE_LEAGUE) && !read_only ?
+                        training_temperature : nothing
 
  selected_policy = if isnothing(policy)
   create_policy(seed=seed)
@@ -1069,6 +1100,7 @@ function create_trainer(
  trainer = OnlineTrainer(
   selected_policy, restored.optimizer_state, ReentrantLock(), ReentrantLock(), mode, read_only,
   eval_training_mixture,
+  selected_temperature,
   selected_device, selected_backend, Float32(gamma), Float32(gae_lambda), Float32(clip_epsilon), Float32(value_coefficient),
   Float32(entropy_coefficient), restored.update_count, 0, selected_path, Int(batch_size),
   Int(rollout_fragment), Int(ppo_epochs), Int(checkpoint_every), TrajectoryFragment[], false,
@@ -1091,10 +1123,19 @@ function create_trainer(
    directory=selected_league_path,
    snapshot_override=selected_override,
    read_only,
-   action_selection=is_training(trainer) || eval_training_mixture ? "training_mixture" : "greedy",
+   action_selection=is_training(trainer) ?
+                    (isnothing(selected_temperature) ? "training_mixture" : "training_temperature") :
+                    (eval_training_mixture ? "training_mixture" : "greedy"),
+   opponent_action_selection=is_training(trainer) || eval_training_mixture ? "training_mixture" : "greedy",
   )
  end
- log_event("trainer_seed"; seed=Int(seed), mode=String(mode), train_player=Int(train_player), read_only)
+ log_event(
+  "trainer_seed"; seed=Int(seed), mode=String(mode), train_player=Int(train_player), read_only,
+  training_policy=is_training(trainer) ?
+                  (isnothing(selected_temperature) ? "training_mixture" : "training_temperature") :
+                  (eval_training_mixture ? "training_mixture" : "greedy"),
+  training_temperature=selected_temperature,
+ )
  return trainer
 end
 
@@ -1205,7 +1246,7 @@ function _train_ppo_snapshot!(
   result = Flux.withgradient(policy) do trained_policy
    _ppo_loss(
     trained_policy, batch, trainer.clip_epsilon,
-    trainer.value_coefficient, trainer.entropy_coefficient,
+    trainer.value_coefficient, trainer.entropy_coefficient, trainer.training_temperature,
    )
   end
   loss = Float32(result.val)
@@ -1286,6 +1327,8 @@ function _run_ppo_update_worker!(
    steps=step_count,
    epochs=trainer.ppo_epochs,
    training_backend=String(trainer.training_backend),
+   training_policy=isnothing(trainer.training_temperature) ? "training_mixture" : "training_temperature",
+   training_temperature=trainer.training_temperature,
    loss,
    duration_ms,
    checkpoint_due,
@@ -1458,7 +1501,10 @@ function process_step!(
   end
 
   if is_training(trainer) || trainer.eval_training_mixture
-   log_probabilities = training_action_log_probabilities(scores, observation.candidates)
+   temperature = training ? trainer.training_temperature : nothing
+   log_probabilities = isnothing(temperature) ?
+                       training_action_log_probabilities(scores, observation.candidates) :
+                       training_action_log_probabilities(scores, observation.candidates; temperature)
    action = _sample_from_log_probabilities(log_probabilities, trainer.rng)
    log_probability = log_probabilities[action+1]
   else
@@ -1471,6 +1517,10 @@ function process_step!(
     "decision_scores";
     player=session.player, sequence, trainable=session.trainable,
     policy_generation=trainer.policy_generation, collectable,
+    action_selection=training && !isnothing(trainer.training_temperature) ?
+                     "training_temperature" :
+                     (is_training(trainer) || trainer.eval_training_mixture ? "training_mixture" : "greedy"),
+    training_temperature=training ? trainer.training_temperature : nothing,
     selected=action, scores,
     kinds=[candidate_kind(candidate) for candidate in observation.candidates],
     preferred=[candidate.words[7] for candidate in observation.candidates],

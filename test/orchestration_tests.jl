@@ -47,6 +47,39 @@ end
   "--wall-timeout-seconds", "3"])).wall_timeout_seconds == 3
 end
 
+@testset "coordinator freezes training temperature without changing evaluation" begin
+ mktempdir() do data_dir
+  map = roster_map(data_dir, "temperature", ["computer", "computer"])
+  train_arguments = orchestration_args(
+   "train"; data_dir, matches=1, extras=["--map", map],
+  )
+  eval_arguments = orchestration_args(
+   "evaluate"; data_dir, matches=1,
+   extras=["--held-out-map", map, "--checkpoint", joinpath(data_dir, "frozen.jls")],
+  )
+  withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => nothing) do
+   @test isnothing(parse_options(train_arguments).training_temperature)
+  end
+  withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => "20") do
+   options = parse_options(train_arguments)
+   @test options.training_temperature == 20.0f0
+   match = only(build_schedule(options))
+   withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => "3") do
+    @test options.training_temperature == 20.0f0
+    _, overrides, _ = build_match_command(options, match)
+    @test overrides["WAR1GUS_AI_TRAIN_TEMPERATURE"] == "20.0"
+   end
+  end
+  withenv("WAR1GUS_AI_TRAIN_TEMPERATURE" => "invalid") do
+   @test_throws ArgumentError parse_options(train_arguments)
+   evaluation = parse_options(eval_arguments)
+   @test isnothing(evaluation.training_temperature)
+   _, overrides, _ = build_match_command(evaluation, only(build_schedule(evaluation)))
+   @test !haskey(overrides, "WAR1GUS_AI_TRAIN_TEMPERATURE")
+  end
+ end
+end
+
 @testset "schedules use each selected map's trainable computer roster" begin
  mktempdir() do data_dir
   duel = roster_map(data_dir, "duel", ["computer", "computer", "person"];

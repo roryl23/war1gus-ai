@@ -3,6 +3,7 @@
 
 using Random
 using Sockets
+include(joinpath(@__DIR__, "src", "training_temperature.jl"))
 
 const DEFAULT_WALL_TIMEOUT_SECONDS = 7200
 const REQUIRED_OPTIONS = (:launcher, :data_dir, :matches, :workers, :timeout_cycles, :seed,
@@ -83,6 +84,7 @@ function parse_options(arguments::Vector{String})
   values[:checkpoint] === nothing && throw(ArgumentError("evaluate requires --checkpoint"))
   values[:reset] && throw(ArgumentError("evaluate cannot reset training state"))
  end
+ training_temperature = mode == "train" ? training_temperature_from_environment() : nothing
  return (; mode, launcher=values[:launcher], data_dir=values[:data_dir], maps=copy(values[:maps]),
   held_out_maps=copy(values[:held_out_maps]), matches=values[:matches], workers=values[:workers],
   timeout_cycles=values[:timeout_cycles], wall_timeout_seconds=values[:wall_timeout_seconds],
@@ -90,7 +92,7 @@ function parse_options(arguments::Vector{String})
   state_root=values[:state_root], checkpoint=values[:checkpoint],
   league_snapshot=values[:league_snapshot], schedule=values[:schedule], reset=values[:reset],
   fast_forward=values[:fast_forward], training_mixture=values[:training_mixture],
-  rollout_config=values[:rollout_config])
+  training_temperature, rollout_config=values[:rollout_config])
 end
 
 """Read the selected map's literal player roster; never execute map Lua to discover seats."""
@@ -295,6 +297,9 @@ function build_match_command(options, match)
   "STRATAGUS_UNBUFFERED_STDIO" => "1",
   "WAR1GUS_AI_PORT" => string(match.port),
  )
+ if options.mode == "train" && !isnothing(options.training_temperature)
+  environment["WAR1GUS_AI_TRAIN_TEMPERATURE"] = string(options.training_temperature)
+ end
  if options.mode == "evaluate"
   environment["WAR1GUS_AI_READ_ONLY"] = "1"
  end
@@ -746,7 +751,15 @@ function run_orchestration(options; output_created=Ref(false))
   output_created[] = true
   options.mode == "train" && options.reset && reset_training_state!(options)
   for match in schedule
-   emit!(output, output_lock, "schedule"; match_id=match.match_id, map=match.map, train_player=match.train_player, seed=string(match.seed), port=match.port, mode=match.mode, action_selection=options.mode == "evaluate" ? (options.training_mixture ? "training_mixture" : "greedy") : "training_mixture")
+   emit!(
+    output, output_lock, "schedule";
+    match_id=match.match_id, map=match.map, train_player=match.train_player,
+    seed=string(match.seed), port=match.port, mode=match.mode,
+    action_selection=options.mode == "evaluate" ?
+                     (options.training_mixture ? "training_mixture" : "greedy") :
+                     (isnothing(options.training_temperature) ? "training_mixture" : "training_temperature"),
+    training_temperature=options.training_temperature,
+   )
   end
   queue = Channel{Any}(length(schedule))
   foreach(match -> put!(queue, match), schedule)

@@ -324,6 +324,46 @@ foundation exists. `wait` remains selectable. Only the mutable seat
 contributes PPO trajectories, whose likelihoods and entropy use the exact
 sampling mixture. Inference and league evaluation remain greedy.
 
+For an isolated **experimental** training run, set
+`WAR1GUS_AI_TRAIN_TEMPERATURE=20` on the launcher/coordinator process. Only the
+mutable training seat then samples `softmax(candidate_scores / 20)`; its stored
+behavior log probability, PPO likelihood ratio, and entropy all use that same
+tempered policy. The temperature is validated as a finite positive number and
+fixed when the trainer starts, including across background PPO updates. Leaving
+the variable unset retains the original 20% policy / 80% weighted non-wait
+mixture without changing checkpoint format. In league training, frozen
+opponents **still use that original mixture** under both settings; only the
+mutable seat changes. Normal inference and read-only league evaluation remain
+greedy, including when the temperature variable is set; the separate
+`--training-mixture` read-only diagnostic continues to sample the original
+mixture, not the temperature policy. The coordinator freezes its selected
+training temperature when parsing the run and records `action_selection` plus
+numeric `training_temperature` on each `schedule` event; `trainer_seed`,
+`league_configuration`, `decision_scores` (when verbose), and `ppo_update`
+also expose the selected policy and/or temperature for auditing. Compare only
+separately cloned copies of the same checkpoint, frozen opponent snapshot,
+runtime, and explicit schedule; never train or sync against the installed
+extracted data.
+
+The controlled T=20 trial is **not recommended as the default** and its
+checkpoint was **not promoted**. With the same starting checkpoint, frozen
+opponent, engine, runtime, and explicit schedules (16 training matches per
+arm, then eight greedy held-out matches per arm), the temperature arm learned
+to choose non-wait in all 20 of 20 applicable saved states where the mixture
+arm still chose wait. Across nine actor states, mean wait-minus-nonwait score
+gap changed from 35.77 initially to 34.06 for the mixture arm and −3.59 for
+T=20. This fixed the measured gradient/greedy-collapse mechanism but did
+**not** produce deployable gameplay: both arms timed out in all eight greedy
+held-out matches with no gathering, production, or kills. During training,
+the mixture arm gathered 26,002 resources, trained 154 units, completed 72
+buildings, and made 13 kills, versus 7,262 resources, 38 units, 15 buildings,
+and four kills for T=20; the latter lost four training matches versus zero
+for the mixture arm. Published build/stop actions in the temperature arm did
+not result in completed production during held-out evaluation. The retained
+trial measurements are in
+`ai-training/temperature-experiment-iiY9ApEX/results.json`. The opt-in
+remains solely for reproducibility; the original mixture stays the default.
+
 The coordinator also refreshes those files in `--data-dir` before validating
 selected maps or resetting a checkpoint. Direct training and evaluation runs
 therefore do not require a separate build solely to sync changed scripts or

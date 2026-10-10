@@ -617,6 +617,183 @@ function ChainRulesCore.rrule(
  return statistics, gpu_segmented_pullback
 end
 
+# Temperature is fixed by the trainer, not sampled from the environment while
+# the background worker updates a batch. These are the actual behavior-policy
+# log probabilities and entropy, rather than statistics of an untempered proxy.
+function _segmented_temperature_statistics_with_cache(
+ scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}, temperature::Float32,
+)
+ statistics = Matrix{Float32}(undef, 2, length(actions))
+ log_probabilities = similar(scores)
+ probabilities = similar(scores)
+ for index in eachindex(actions)
+  first_candidate = offsets[index]
+  last_candidate = offsets[index+1] - 1
+  maximum_score = -Inf32
+  for candidate in first_candidate:last_candidate
+   maximum_score = max(maximum_score, scores[candidate] / temperature)
+  end
+  normalization = 0.0f0
+  for candidate in first_candidate:last_candidate
+   normalization += exp(scores[candidate] / temperature - maximum_score)
+  end
+  log_normalization = log(normalization)
+  entropy = 0.0f0
+  for candidate in first_candidate:last_candidate
+   log_probability = scores[candidate] / temperature - maximum_score - log_normalization
+   log_probabilities[candidate] = log_probability
+   probability = exp(log_probability)
+   probabilities[candidate] = probability
+   entropy -= probability * log_probability
+  end
+  statistics[1, index] = log_probabilities[actions[index]]
+  statistics[2, index] = entropy
+ end
+ return statistics, log_probabilities, probabilities
+end
+
+_segmented_temperature_statistics(
+ scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}, temperature::Float32,
+) = first(_segmented_temperature_statistics_with_cache(scores, offsets, actions, temperature))
+
+function ChainRulesCore.rrule(
+ ::typeof(_segmented_temperature_statistics),
+ scores::Vector{Float32}, offsets::Vector{Int}, actions::Vector{Int}, temperature::Float32,
+)
+ statistics, log_probabilities, probabilities =
+  _segmented_temperature_statistics_with_cache(scores, offsets, actions, temperature)
+ function temperature_pullback(cotangent)
+  cotangent = ChainRulesCore.unthunk(cotangent)
+  if cotangent isa ChainRulesCore.AbstractZero
+   return (ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(),
+    ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent())
+  end
+  score_gradient = similar(scores)
+  for index in eachindex(actions)
+   first_candidate = offsets[index]
+   last_candidate = offsets[index+1] - 1
+   weighted_log_probability = 0.0f0
+   for candidate in first_candidate:last_candidate
+    weighted_log_probability += probabilities[candidate] * log_probabilities[candidate]
+   end
+   for candidate in first_candidate:last_candidate
+    probability = probabilities[candidate]
+    score_gradient[candidate] = (
+     cotangent[1, index] * ((candidate == actions[index] ? 1.0f0 : 0.0f0) - probability) -
+     cotangent[2, index] * probability *
+     (log_probabilities[candidate] - weighted_log_probability)
+    ) / temperature
+   end
+  end
+  return (ChainRulesCore.NoTangent(), score_gradient,
+   ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent())
+ end
+ return statistics, temperature_pullback
+end
+
+@kernel function _gpu_temperature_statistics!(
+ statistics, log_probabilities, probabilities, scores, offsets, actions, temperature,
+)
+ state = @index(Global)
+ if state <= length(actions)
+  first_candidate = offsets[state]
+  last_candidate = offsets[state+1] - 1
+  maximum_score = -Inf32
+  for candidate in first_candidate:last_candidate
+   maximum_score = max(maximum_score, scores[candidate] / temperature)
+  end
+  normalization = 0.0f0
+  for candidate in first_candidate:last_candidate
+   normalization += exp(scores[candidate] / temperature - maximum_score)
+  end
+  log_normalization = log(normalization)
+  entropy = 0.0f0
+  for candidate in first_candidate:last_candidate
+   log_probability = scores[candidate] / temperature - maximum_score - log_normalization
+   log_probabilities[candidate] = log_probability
+   probability = exp(log_probability)
+   probabilities[candidate] = probability
+   entropy -= probability * log_probability
+  end
+  statistics[1, state] = log_probabilities[actions[state]]
+  statistics[2, state] = entropy
+ end
+end
+
+@kernel function _gpu_temperature_pullback!(
+ gradient, cotangent, log_probabilities, probabilities, offsets, actions, temperature,
+)
+ state = @index(Global)
+ if state <= length(actions)
+  first_candidate = offsets[state]
+  last_candidate = offsets[state+1] - 1
+  weighted_log_probability = 0.0f0
+  for candidate in first_candidate:last_candidate
+   weighted_log_probability += probabilities[candidate] * log_probabilities[candidate]
+  end
+  for candidate in first_candidate:last_candidate
+   probability = probabilities[candidate]
+   gradient[candidate] = (
+    cotangent[1, state] * ((candidate == actions[state] ? 1.0f0 : 0.0f0) - probability) -
+    cotangent[2, state] * probability *
+    (log_probabilities[candidate] - weighted_log_probability)
+   ) / temperature
+  end
+ end
+end
+
+function _segmented_temperature_statistics_with_cache(
+ scores::AbstractVector{Float32}, offsets::AbstractVector{Int},
+ actions::AbstractVector{Int}, temperature::Float32,
+)
+ statistics = similar(scores, Float32, 2, length(actions))
+ log_probabilities = similar(scores)
+ probabilities = similar(scores)
+ if !isempty(actions)
+  backend = get_backend(scores)
+  _gpu_temperature_statistics!(backend)(
+   statistics, log_probabilities, probabilities, scores, offsets, actions, temperature;
+   ndrange=length(actions),
+  )
+  synchronize(backend)
+ end
+ return statistics, log_probabilities, probabilities
+end
+
+_segmented_temperature_statistics(
+ scores::AbstractVector{Float32}, offsets::AbstractVector{Int},
+ actions::AbstractVector{Int}, temperature::Float32,
+) = first(_segmented_temperature_statistics_with_cache(scores, offsets, actions, temperature))
+
+function ChainRulesCore.rrule(
+ ::typeof(_segmented_temperature_statistics),
+ scores::AbstractVector{Float32}, offsets::AbstractVector{Int},
+ actions::AbstractVector{Int}, temperature::Float32,
+)
+ statistics, log_probabilities, probabilities =
+  _segmented_temperature_statistics_with_cache(scores, offsets, actions, temperature)
+ function gpu_temperature_pullback(cotangent)
+  cotangent = ChainRulesCore.unthunk(cotangent)
+  if cotangent isa ChainRulesCore.AbstractZero
+   return (ChainRulesCore.NoTangent(), ChainRulesCore.ZeroTangent(),
+    ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent())
+  end
+  score_gradient = similar(scores)
+  if !isempty(actions)
+   backend = get_backend(scores)
+   _gpu_temperature_pullback!(backend)(
+    score_gradient, cotangent, log_probabilities, probabilities, offsets, actions, temperature;
+    ndrange=length(actions),
+   )
+   synchronize(backend)
+  end
+  return (ChainRulesCore.NoTangent(), score_gradient,
+   ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent(), ChainRulesCore.NoTangent())
+ end
+ return statistics, gpu_temperature_pullback
+end
+
+
 function _constant_zeros_like(array::AbstractMatrix{Float32}, rows::Int, columns::Int)
  output = similar(array, Float32, rows, columns)
  fill!(output, 0.0f0)
@@ -627,6 +804,7 @@ ChainRulesCore.@non_differentiable _constant_zeros_like(::AbstractMatrix{Float32
 function _ppo_loss(
  policy::AiPolicy, batch::PpoBatch, clip_epsilon::Float32,
  value_coefficient::Float32, entropy_coefficient::Float32,
+ temperature::Union{Nothing,Float32}=nothing,
 )
  count = length(batch.actions)
  header_embeddings = policy.header_encoder(batch.headers)
@@ -663,9 +841,11 @@ function _ppo_loss(
 
  # Segment reductions and GPU ragged gathers use custom rules; clipping retains
  # ordinary Flux AD semantics, including min/max/clamp tie behavior.
- statistics = _segmented_policy_statistics(
+ statistics = isnothing(temperature) ? _segmented_policy_statistics(
   scores, batch.candidate_offsets, batch.actions, batch.first_waits,
   batch.exploration_weights, batch.exploration_weight_sums,
+ ) : _segmented_temperature_statistics(
+  scores, batch.candidate_offsets, batch.actions, temperature,
  )
  log_probabilities = @view statistics[1, :]
  entropy = @view statistics[2, :]
